@@ -138,6 +138,11 @@ the client:
 .\build\Debug\client.exe --address localhost:50051 --ca ca.pem --cert client.pem --key client-key.pem
 ```
 
+The server requires all three TLS options together. If any TLS option is supplied without
+the other two, startup fails instead of silently falling back to plaintext. If none are
+supplied, gRPC remains unauthenticated and unencrypted; keep that mode on a trusted local
+network only.
+
 Outbound peer endpoints can be reloaded without restarting a node. Pass `--peers-file` and keep one
 `host:port` endpoint per line; editing the file updates the peer stubs. This is not Raft joint
 consensus and does not safely change a live cluster's voting membership. Keep cluster membership

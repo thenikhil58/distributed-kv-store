@@ -62,6 +62,11 @@ struct TlsConfig
     {
         return !ca_file.empty() && !certificate_file.empty() && !private_key_file.empty();
     }
+
+    bool Configured() const
+    {
+        return !ca_file.empty() || !certificate_file.empty() || !private_key_file.empty();
+    }
 };
 
 static std::string ReadTextFile(const std::string &path)
@@ -1985,7 +1990,7 @@ public:
     }
 };
 
-void RunServer(const std::string &port, const std::vector<std::string> &peer_addresses,
+bool RunServer(const std::string &port, const std::vector<std::string> &peer_addresses,
                const std::vector<int> &peer_ids, const TlsConfig &tls_config,
                const std::filesystem::path &membership_path,
                const std::filesystem::path &data_root)
@@ -2022,11 +2027,12 @@ void RunServer(const std::string &port, const std::vector<std::string> &peer_add
     {
         std::cerr << "Failed to start server on " << server_address
                   << " - the port may already be in use." << std::endl;
-        return;
+        return false;
     }
 
     std::cout << "Server listening on " << server_address << " [starting as FOLLOWER]" << std::endl;
     server->Wait();
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -2118,8 +2124,13 @@ int main(int argc, char **argv)
         add_peer(argv[i]);
     }
 
+    if (tls_config.Configured() && !tls_config.Enabled())
+    {
+        std::cerr << "TLS requires --ca, --cert, and --key to be configured together." << std::endl;
+        return 2;
+    }
+
     if (tls_config.Enabled())
         std::cout << "TLS/mTLS enabled" << std::endl;
-    RunServer(port, peer_addresses, peer_ids, tls_config, membership_path, data_root);
-    return 0;
+    return RunServer(port, peer_addresses, peer_ids, tls_config, membership_path, data_root) ? 0 : 1;
 }

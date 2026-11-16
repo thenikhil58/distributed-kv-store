@@ -166,6 +166,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     rate_limit_max_requests = RATE_LIMIT_MAX_REQUESTS
     _login_bucket = {}
     _login_bucket_lock = threading.Lock()
+    _metrics_lock = threading.Lock()
 
     def _audit_event(self, event, success, username="", key="", details=None):
         if not self.__class__.audit_log_path:
@@ -241,8 +242,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _record_metric(method, status_code):
-        if method in REQUEST_COUNTERS:
-            REQUEST_COUNTERS[method] += 1
+        with GatewayHandler._metrics_lock:
+            if method in REQUEST_COUNTERS:
+                REQUEST_COUNTERS[method] += 1
 
     def _send(self, status, payload, headers=()):
         body = json.dumps(payload).encode("utf-8")
@@ -313,7 +315,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/metrics":
             lines = ["# HELP kvstore_requests_total Total HTTP requests handled by the gateway.", "# TYPE kvstore_requests_total counter"]
-            for method, count in REQUEST_COUNTERS.items():
+            with self._metrics_lock:
+                counters = REQUEST_COUNTERS.copy()
+            for method, count in counters.items():
                 lines.append(f'kvstore_requests_total{{method="{method}"}} {count}')
             body = "\n".join(lines) + "\n"
             self.send_response(200)

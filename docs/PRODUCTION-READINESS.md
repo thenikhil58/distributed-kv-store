@@ -15,6 +15,7 @@ This repository is an experimental distributed key-value store and is **not yet 
 - ✅ Gateway now defaults to loopback binding. Public binding requires explicit opt-in and a configured users file; regression tests cover these checks.
 - ✅ Dashboard account authentication, per-user key isolation, and password-file permissions are implemented and covered by gateway tests. This does not authenticate direct gRPC clients.
 - ✅ mTLS options are implemented for server/client/gateway configuration, but mTLS is optional and is not yet enforced as a deployment default.
+- ✅ Partial server TLS configuration is rejected rather than silently falling back to plaintext; bind failures now return a failing process exit code. This does not change the default insecure gRPC mode.
 
 ### Phase 1: Supported deployment profile — incomplete
 
