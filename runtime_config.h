@@ -15,3 +15,5 @@ struct RuntimeConfig {
 };
 
 RuntimeConfig LoadRuntimeConfig(const std::filesystem::path &path);
+int ParsePortNumber(const std::string &value, const std::string &field);
+void ValidateRuntimeConfig(const RuntimeConfig &config);

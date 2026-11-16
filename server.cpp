@@ -2067,12 +2067,22 @@ int main(int argc, char **argv)
     tls_config.ca_file = runtime_config.ca_file;
     tls_config.certificate_file = runtime_config.certificate_file;
     tls_config.private_key_file = runtime_config.private_key_file;
+    bool invalid_peer_endpoint = false;
 
     auto add_peer = [&](const std::string &peer) {
         const auto separator = peer.rfind(':');
         const auto address = separator == std::string::npos ? "localhost:" + peer : peer;
-        peer_addresses.push_back(address);
-        peer_ids.push_back(separator == std::string::npos ? std::stoi(peer) : std::stoi(peer.substr(separator + 1)));
+        try
+        {
+            const auto port_text = separator == std::string::npos ? peer : peer.substr(separator + 1);
+            peer_ids.push_back(ParsePortNumber(port_text, "peer"));
+            peer_addresses.push_back(address);
+        }
+        catch (const std::exception &error)
+        {
+            std::cerr << "Invalid peer endpoint '" << peer << "': " << error.what() << std::endl;
+            invalid_peer_endpoint = true;
+        }
     };
     for (const auto &peer : runtime_config.peers)
         add_peer(peer);
@@ -2124,9 +2134,25 @@ int main(int argc, char **argv)
         add_peer(argv[i]);
     }
 
+    if (invalid_peer_endpoint)
+        return 2;
+
     if (tls_config.Configured() && !tls_config.Enabled())
     {
         std::cerr << "TLS requires --ca, --cert, and --key to be configured together." << std::endl;
+        return 2;
+    }
+
+    RuntimeConfig effective_config = runtime_config;
+    effective_config.port = port;
+    effective_config.peers = peer_addresses;
+    try
+    {
+        ValidateRuntimeConfig(effective_config);
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << "Invalid server configuration: " << error.what() << std::endl;
         return 2;
     }
 

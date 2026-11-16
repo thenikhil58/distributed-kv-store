@@ -89,6 +89,29 @@ TEST(RuntimeConfig, RejectsPartialTlsConfiguration)
     std::filesystem::remove(path);
 }
 
+TEST(RuntimeConfig, RejectsInvalidNodePort)
+{
+    RuntimeConfig config;
+    config.port = "65536";
+    EXPECT_THROW(ValidateRuntimeConfig(config), std::runtime_error);
+}
+
+TEST(RuntimeConfig, RejectsDuplicatePeerPorts)
+{
+    RuntimeConfig config;
+    config.port = "50051";
+    config.peers = {"localhost:50052", "127.0.0.1:50052"};
+    EXPECT_THROW(ValidateRuntimeConfig(config), std::runtime_error);
+}
+
+TEST(RuntimeConfig, RejectsSelfAsPeer)
+{
+    RuntimeConfig config;
+    config.port = "50051";
+    config.peers = {"localhost:50051"};
+    EXPECT_THROW(ValidateRuntimeConfig(config), std::runtime_error);
+}
+
 TEST(RuntimeConfig, IgnoresInlineComments)
 {
     const auto path = std::filesystem::temp_directory_path() / "kvstore-runtime-comments.conf";
