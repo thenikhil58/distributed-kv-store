@@ -16,6 +16,7 @@ This repository is an experimental distributed key-value store and is **not yet 
 - ✅ Dashboard account authentication, per-user key isolation, and password-file permissions are implemented and covered by gateway tests. This does not authenticate direct gRPC clients.
 - ✅ mTLS options are implemented for server/client/gateway configuration, but mTLS is optional and is not yet enforced as a deployment default.
 - ✅ Partial server TLS configuration is rejected rather than silently falling back to plaintext; bind failures now return a failing process exit code. This does not change the default insecure gRPC mode.
+- ✅ The gateway exposes health/readiness endpoints and Prometheus counters for gateway operations and HTTP method/status pairs. These do not provide Raft-node metrics, latency histograms, or resource measurements.
 
 ### Phase 1: Supported deployment profile — incomplete
 
@@ -44,7 +45,7 @@ The initial profile above is a draft, not a finalized contract. Complete and app
 - ⬜ Complete dependency/configuration/threat-model review and test abuse, resource exhaustion, authentication failures, and connection limits.
 - ⬜ Establish approval and handling procedures for production credentials and configuration.
 
-### Phase 4: Operations and observability — not started
+### Phase 4: Operations and observability — incomplete
 
 - ⬜ Add structured, configurable logs and production metrics for Raft state, replication lag, WAL/snapshot activity, request latency/errors, and resource use.
 - ⬜ Define alerts, health/readiness behavior, graceful shutdown, restart policy, and capacity guidance.
