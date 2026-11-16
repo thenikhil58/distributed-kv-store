@@ -1383,9 +1383,18 @@ public:
                 if (entry.key().size() > kMaxKeyBytes || entry.value().size() > kMaxValueBytes ||
                     entry.request_id().size() > kMaxRequestIdBytes)
                     return Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "replicated entry exceeds configured size limits");
+                if (entry.term() < 0 || entry.term() > request->leader_term())
+                    return Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                  "AppendEntries entry term is outside the leader term");
             }
-            if (request->prev_log_index() < -1 || request->leader_commit() < -1)
+            if (request->leader_term() < 0 || request->prev_log_index() < -1 ||
+                request->prev_log_index() == std::numeric_limits<int>::max() ||
+                request->prev_log_term() < 0 || request->leader_commit() < -1)
                 return Status(grpc::StatusCode::INVALID_ARGUMENT, "AppendEntries contains a negative Raft index");
+            if (request->prev_log_index() >= 0 &&
+                request->entries_size() >
+                    std::numeric_limits<int>::max() - request->prev_log_index())
+                return Status(grpc::StatusCode::INVALID_ARGUMENT, "AppendEntries index range overflows");
             if (request->leader_term() > current_term)
             {
                 current_term = request->leader_term();
@@ -1486,6 +1495,11 @@ public:
     {
         if (request->leader_id() != node_id && !IsConfiguredPeer(request->leader_id()))
             return Status(grpc::StatusCode::PERMISSION_DENIED, "snapshot sender is not a configured peer");
+        if (request->leader_term() < 0 || request->last_included_index() < 0 ||
+            request->last_included_index() == std::numeric_limits<int>::max() ||
+            request->last_included_term() < 0 ||
+            request->last_included_term() > request->leader_term())
+            return Status(grpc::StatusCode::INVALID_ARGUMENT, "snapshot contains invalid Raft metadata");
 
         SnapshotState snapshot;
         try

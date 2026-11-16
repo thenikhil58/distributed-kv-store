@@ -728,6 +728,60 @@ TEST(RaftIntegration, EmptyAppendEntriesPreservesMatchingSuffix) {
     EXPECT_EQ(append_response.match_index(), cluster_response.commit_index());
 }
 
+TEST(RaftIntegration, RejectsAppendEntriesWithFutureEntryTerm) {
+    const std::string port = "18071";
+    const std::string address = "localhost:" + port;
+    TestServer server(port);
+    ASSERT_GT(server.pid, 0);
+    ASSERT_TRUE(WaitForServer(address));
+    ASSERT_TRUE(WaitForLeader(address));
+
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub stub(channel);
+    kvstore::ClusterStatusRequest status_request;
+    kvstore::ClusterStatusResponse status_response;
+    grpc::ClientContext status_context;
+    ASSERT_TRUE(stub.GetClusterStatus(&status_context, status_request, &status_response).ok());
+
+    kvstore::AppendEntriesRequest append_request;
+    append_request.set_leader_term(status_response.current_term());
+    append_request.set_leader_id(std::stoi(port));
+    append_request.set_prev_log_index(status_response.commit_index());
+    append_request.set_prev_log_term(status_response.current_term());
+    append_request.add_entries()->set_term(status_response.current_term() + 1);
+    kvstore::AppendEntriesResponse append_response;
+    grpc::ClientContext append_context;
+    const auto status = stub.AppendEntries(&append_context, append_request, &append_response);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+TEST(RaftIntegration, RejectsSnapshotWithNegativeIncludedIndex) {
+    const std::string port = "18072";
+    const std::string address = "localhost:" + port;
+    TestServer server(port);
+    ASSERT_GT(server.pid, 0);
+    ASSERT_TRUE(WaitForServer(address));
+    ASSERT_TRUE(WaitForLeader(address));
+
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub stub(channel);
+    kvstore::ClusterStatusRequest status_request;
+    kvstore::ClusterStatusResponse status_response;
+    grpc::ClientContext status_context;
+    ASSERT_TRUE(stub.GetClusterStatus(&status_context, status_request, &status_response).ok());
+
+    kvstore::InstallSnapshotRequest snapshot_request;
+    snapshot_request.set_leader_term(status_response.current_term());
+    snapshot_request.set_leader_id(std::stoi(port));
+    snapshot_request.set_last_included_index(-1);
+    snapshot_request.set_last_included_term(0);
+    snapshot_request.set_done(true);
+    kvstore::InstallSnapshotResponse snapshot_response;
+    grpc::ClientContext snapshot_context;
+    const auto status = stub.InstallSnapshot(&snapshot_context, snapshot_request, &snapshot_response);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
 uint32_t ComputeCrc32ForTest(const std::string &payload) {
     constexpr std::uint32_t polynomial = 0xEDB88320u;
     std::uint32_t crc = 0xFFFFFFFFu;

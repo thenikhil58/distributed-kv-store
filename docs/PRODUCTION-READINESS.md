@@ -69,6 +69,7 @@ qualified support contract. Remaining work:
 
 - ⬜ Audit term changes, elections/voting, log matching, commit advancement, leader transitions, and snapshot installation against Raft safety rules.
 - ✅ Keep voting membership static and clearly identify peer-file reload as endpoint configuration only; safe membership changes are not implemented.
+- ✅ Reject malformed AppendEntries term/index ranges and invalid snapshot Raft metadata; focused regression cases are added but have not been run.
 - ⬜ Test partitions, delayed/reordered messages, repeated crashes, disk-full/I/O errors, corrupt or truncated metadata/snapshots, and stale/lagging node recovery.
 - ⬜ Verify acknowledged-write durability for the explicitly supported crash and power-loss model.
 - ⬜ Add long-running multi-node soak tests and obtain independent consensus/persistence review.
