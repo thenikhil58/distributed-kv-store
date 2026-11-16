@@ -18,6 +18,8 @@ WAL and metadata writes are flushed and synchronized before acknowledgement. Thi
 depends on the operating system, filesystem, storage device, and their honoring
 `fsync`; it does not protect against arbitrary hardware that lies about durable
 writes, loss of a majority, or operator deletion/corruption of data.
+The persistence implementation uses POSIX file operations; no specific filesystem
+or power-loss behavior has been qualified. There is no published RPO or RTO.
 
 Providing a non-empty `request_id` makes a retry of the same request return its
 original result, including after restart and snapshot recovery. The caller must
@@ -51,4 +53,5 @@ network.
 Snapshots include a format marker and CRC-protected protobuf payload. The reader
 continues to accept the earlier unversioned snapshot and WAL formats for local
 development. Keep a backup before upgrading data files; there is no supported
-rolling on-disk or wire-format upgrade procedure yet.
+rolling on-disk or wire-format upgrade procedure yet. Do not mix server versions
+in a cluster or downgrade binaries against data written by a newer version.
