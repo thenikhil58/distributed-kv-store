@@ -604,6 +604,13 @@ private:
                 const auto absolute_index = entry.log_index_plus_one() - 1;
                 if (absolute_index > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
                     throw std::runtime_error("WAL log index exceeds supported range");
+                if (entry.term() < 0)
+                    throw std::runtime_error("WAL entry has a negative term");
+                if (entry.key().size() > kMaxKeyBytes ||
+                    entry.value().size() > kMaxValueBytes ||
+                    entry.request_id().size() > kMaxRequestIdBytes ||
+                    entry.client_id().size() > kMaxRequestIdBytes)
+                    throw std::runtime_error("WAL entry exceeds configured size limits");
                 if (absolute_index >= static_cast<std::uint64_t>(snapshot_last_index + 1))
                 {
                     if (absolute_index != static_cast<std::uint64_t>(log_offset + static_cast<int>(log_entries.size())))
@@ -614,6 +621,13 @@ private:
             }
             else if (wal_index > snapshot_last_index)
             {
+                if (entry.term() < 0)
+                    throw std::runtime_error("legacy WAL entry has a negative term");
+                if (entry.key().size() > kMaxKeyBytes ||
+                    entry.value().size() > kMaxValueBytes ||
+                    entry.request_id().size() > kMaxRequestIdBytes ||
+                    entry.client_id().size() > kMaxRequestIdBytes)
+                    throw std::runtime_error("legacy WAL entry exceeds configured size limits");
                 entry.set_log_index_plus_one(static_cast<std::uint64_t>(wal_index) + 1);
                 log_entries.push_back(std::move(entry));
                 ++wal_index;
@@ -682,6 +696,9 @@ private:
             if (payload_size > 256 * 1024 * 1024 ||
                 file_data.size() != header_size + payload_size)
                 throw std::runtime_error("invalid Raft snapshot payload size");
+            if (snapshot_last_index < 0 || snapshot_last_term < 0 ||
+                snapshot_last_term > snapshot_last_index)
+                throw std::runtime_error("invalid Raft snapshot metadata");
             const std::string payload = file_data.substr(offset, payload_size);
             if (ComputeCrc32(payload) != checksum)
                 throw std::runtime_error("Raft snapshot checksum mismatch");
@@ -702,6 +719,9 @@ private:
         legacy.read(reinterpret_cast<char *>(&count), sizeof(count));
         if (!legacy || count > 10000000)
             throw std::runtime_error("invalid Raft snapshot header");
+        if (snapshot_last_index < 0 || snapshot_last_term < 0 ||
+            snapshot_last_term > snapshot_last_index)
+            throw std::runtime_error("invalid legacy Raft snapshot metadata");
 
         for (std::uint32_t i = 0; i < count; ++i)
         {

@@ -12,6 +12,8 @@ Build with CMake, start a node, then run:
 ```
 
 For useful comparisons, record the commit, compiler/build type, node count, hardware,
-network, operation count, and run conditions. Repeat runs and report latency percentiles
-as well as throughput before using results to set capacity expectations. Production
-performance and scale testing remain open work; see [../docs/PRODUCTION-READINESS.md](../docs/PRODUCTION-READINESS.md).
+network, operation count, storage, and run conditions. Repeat runs and report latency
+percentiles as well as throughput before using results to set capacity expectations.
+The benchmark reports sequential end-to-end operation latency, including p50, p95,
+p99, and maximum milliseconds. Production performance and scale testing remain open
+work; see [../docs/PRODUCTION-READINESS.md](../docs/PRODUCTION-READINESS.md).

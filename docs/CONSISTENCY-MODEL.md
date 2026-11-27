@@ -40,6 +40,14 @@ same-term quorum round trip without model checking and fault-injection evidence.
 `EVENTUAL` reads may be served from a follower's locally applied state. They can
 be stale by an unbounded amount during a partition or while a node catches up.
 
+## Phase 1 deployment boundary
+
+There is no established availability target, RTO, or RPO. The only published
+capacity limits are per-operation input limits: 4 KiB keys, 1 MiB values, and 256-byte
+request or client IDs. Aggregate keyspace, disk usage, and write rate have no
+qualified limits. Benchmark throughput and latency measurements describe the test
+conditions only and must not be interpreted as a production support contract.
+
 ## Membership and security boundaries
 
 The voting membership is static. Reloading a peer file changes outbound

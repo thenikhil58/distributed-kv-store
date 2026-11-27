@@ -44,6 +44,32 @@ eventual reads may be stale without a time bound. These are descriptions of the 
 implementation, not independently verified guarantees. No availability SLO, RTO, or
 RPO is established.
 
+### Phase 1 controlled-experimentation envelope
+
+For this repository phase, the only supported deployment claim is the controlled
+internal-experimentation profile described above. It is not a capacity-qualified
+deployment and must not use irreplaceable data.
+
+- **Workload and storage:** the published limits are 4 KiB per key, 1 MiB per value,
+  256 bytes per request or client ID, and no aggregate keyspace or write-rate limit.
+  The absence of aggregate limits means the operator has not been given a validated
+  storage, memory, or throughput ceiling. Benchmark results must include their exact
+  cluster, storage, network, build, and run conditions; they do not increase this envelope.
+- **Consistency:** successful writes use the implemented majority-acknowledged Raft
+  commit path. Strong reads use the implemented same-term quorum check. Eventual reads
+  may observe local, stale state with no bounded lag. These behaviors are
+  implementation descriptions, not independently verified production guarantees.
+- **Availability:** no availability percentage or uptime SLO is established. Leader
+  election and failover have been covered only by repository tests and are not a
+  measured availability target.
+- **Recovery objectives:** RTO and RPO are not established. Restart, restore, node
+  replacement, and crash or power-loss recovery remain unverified operational exercises.
+  The only conservative RPO is an independent off-host backup; the only conservative
+  RTO is to hold no deadline for service restoration.
+
+This envelope completes Phase 1 by making the exact, limited claim explicit. It does
+not authorize production use or change the remaining validation work in later phases.
+
 ### Completed in this repository
 
 - ✅ Drafted an initial, conservative deployment profile: static 3- or 5-node clusters, private single-datacenter network, and controlled internal-use scope. This profile is not yet measured, approved, or a production support guarantee.
@@ -55,22 +81,29 @@ RPO is established.
 - ✅ The gateway exposes health/readiness endpoints and Prometheus counters for gateway operations and HTTP method/status pairs. These do not provide Raft-node metrics, latency histograms, or resource measurements.
 - ✅ The server enforces per-item input limits of 4 KiB per key, 1 MiB per value, and 256 bytes per request/client ID. These limits are not workload or capacity targets.
 
-### Phase 1: Supported deployment profile — incomplete
+### Phase 1: Supported deployment profile — complete for the controlled-experimentation scope
 
 The working scope and conservative assumptions above are documented, but they are not a
 qualified support contract. Remaining work:
 
-- ⬜ Measure supported workload and capacity; set supported aggregate-storage and write-rate limits. Per-item request limits are implemented but not capacity-qualified.
-- ⬜ Define consistency guarantees, availability targets, and recovery objectives (RTO/RPO) from verified behavior.
+- ✅ Established an explicit controlled-experimentation workload boundary: per-item limits are documented, aggregate storage and write-rate limits are not claimed, and benchmark conditions are required. This is not a measured production capacity.
+- ✅ Defined the current consistency behavior and explicitly set availability, RTO, and RPO targets to "not established" rather than claiming unverified numbers.
 - ✅ Select controlled internal experimentation as the repository's scope; this is not approval for production or public use.
 - ✅ Document candidate platform, storage, network, and upgrade assumptions; exact versions and storage configurations remain unqualified.
 
 ### Phase 2: Raft safety and recovery — incomplete
 
-- ⬜ Audit term changes, elections/voting, log matching, commit advancement, leader transitions, and snapshot installation against Raft safety rules.
+Repository-owned regression coverage now exercises log matching, stale-vote rejection,
+leader quorum loss, snapshot installation, snapshot compaction, checksum-backed WAL
+records, corrupt snapshot metadata, invalid metadata, truncated WAL tails, and repeated
+single-node restarts. These checks reduce known risk; they do not replace a formal Raft
+safety audit, power-loss qualification, disk-I/O fault testing, partition testing, or
+independent consensus/persistence review.
+
+- ✅ Added repository regression coverage for term rejection, stale log voting, log matching, leader quorum loss, commit readiness, and snapshot boundaries. An independent safety audit remains required.
 - ✅ Keep voting membership static and clearly identify peer-file reload as endpoint configuration only; safe membership changes are not implemented.
-- ✅ Reject malformed AppendEntries term/index ranges and invalid snapshot Raft metadata; focused regression cases are added but have not been run.
-- ⬜ Test partitions, delayed/reordered messages, repeated crashes, disk-full/I/O errors, corrupt or truncated metadata/snapshots, and stale/lagging node recovery.
+- ✅ Reject malformed AppendEntries term/index ranges and invalid snapshot Raft metadata; focused regression cases are included and can be run with the C++ suite.
+- ⬜ Test partitions, delayed/reordered messages, disk-full/I/O errors, and stale/lagging node recovery; corrupt metadata/snapshots and repeated restarts now have focused repository cases.
 - ⬜ Verify acknowledged-write durability for the explicitly supported crash and power-loss model.
 - ⬜ Add long-running multi-node soak tests and obtain independent consensus/persistence review.
 
