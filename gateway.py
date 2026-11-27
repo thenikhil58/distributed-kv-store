@@ -35,6 +35,7 @@ REQUEST_COUNTERS = {
     "restore": 0,
     "auth_failure": 0,
 }
+HTTP_RESPONSE_COUNTERS = {}
 PASSWORD_ITERATIONS = 310_000
 SESSION_COOKIE = "raft_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
@@ -166,6 +167,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     rate_limit_max_requests = RATE_LIMIT_MAX_REQUESTS
     _login_bucket = {}
     _login_bucket_lock = threading.Lock()
+    _metrics_lock = threading.Lock()
 
     def _audit_event(self, event, success, username="", key="", details=None):
         if not self.__class__.audit_log_path:
@@ -241,8 +243,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _record_metric(method, status_code):
-        if method in REQUEST_COUNTERS:
-            REQUEST_COUNTERS[method] += 1
+        with GatewayHandler._metrics_lock:
+            if method in REQUEST_COUNTERS:
+                REQUEST_COUNTERS[method] += 1
+
+    def send_response(self, code, message=None):
+        super().send_response(code, message)
+        key = (self.command or "unknown", code)
+        with self._metrics_lock:
+            HTTP_RESPONSE_COUNTERS[key] = HTTP_RESPONSE_COUNTERS.get(key, 0) + 1
 
     def _send(self, status, payload, headers=()):
         body = json.dumps(payload).encode("utf-8")
@@ -313,8 +322,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/metrics":
             lines = ["# HELP kvstore_requests_total Total HTTP requests handled by the gateway.", "# TYPE kvstore_requests_total counter"]
-            for method, count in REQUEST_COUNTERS.items():
+            with self._metrics_lock:
+                counters = REQUEST_COUNTERS.copy()
+                response_counters = HTTP_RESPONSE_COUNTERS.copy()
+            for method, count in counters.items():
                 lines.append(f'kvstore_requests_total{{method="{method}"}} {count}')
+            lines.extend([
+                "# HELP kvstore_http_responses_total HTTP responses returned by method and status.",
+                "# TYPE kvstore_http_responses_total counter",
+            ])
+            for (method, status), count in sorted(response_counters.items()):
+                lines.append(
+                    f'kvstore_http_responses_total{{method="{method}",status="{status}"}} {count}'
+                )
             body = "\n".join(lines) + "\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

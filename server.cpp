@@ -62,6 +62,11 @@ struct TlsConfig
     {
         return !ca_file.empty() && !certificate_file.empty() && !private_key_file.empty();
     }
+
+    bool Configured() const
+    {
+        return !ca_file.empty() || !certificate_file.empty() || !private_key_file.empty();
+    }
 };
 
 static std::string ReadTextFile(const std::string &path)
@@ -599,6 +604,13 @@ private:
                 const auto absolute_index = entry.log_index_plus_one() - 1;
                 if (absolute_index > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
                     throw std::runtime_error("WAL log index exceeds supported range");
+                if (entry.term() < 0)
+                    throw std::runtime_error("WAL entry has a negative term");
+                if (entry.key().size() > kMaxKeyBytes ||
+                    entry.value().size() > kMaxValueBytes ||
+                    entry.request_id().size() > kMaxRequestIdBytes ||
+                    entry.client_id().size() > kMaxRequestIdBytes)
+                    throw std::runtime_error("WAL entry exceeds configured size limits");
                 if (absolute_index >= static_cast<std::uint64_t>(snapshot_last_index + 1))
                 {
                     if (absolute_index != static_cast<std::uint64_t>(log_offset + static_cast<int>(log_entries.size())))
@@ -609,6 +621,13 @@ private:
             }
             else if (wal_index > snapshot_last_index)
             {
+                if (entry.term() < 0)
+                    throw std::runtime_error("legacy WAL entry has a negative term");
+                if (entry.key().size() > kMaxKeyBytes ||
+                    entry.value().size() > kMaxValueBytes ||
+                    entry.request_id().size() > kMaxRequestIdBytes ||
+                    entry.client_id().size() > kMaxRequestIdBytes)
+                    throw std::runtime_error("legacy WAL entry exceeds configured size limits");
                 entry.set_log_index_plus_one(static_cast<std::uint64_t>(wal_index) + 1);
                 log_entries.push_back(std::move(entry));
                 ++wal_index;
@@ -677,6 +696,9 @@ private:
             if (payload_size > 256 * 1024 * 1024 ||
                 file_data.size() != header_size + payload_size)
                 throw std::runtime_error("invalid Raft snapshot payload size");
+            if (snapshot_last_index < 0 || snapshot_last_term < 0 ||
+                snapshot_last_term > snapshot_last_index)
+                throw std::runtime_error("invalid Raft snapshot metadata");
             const std::string payload = file_data.substr(offset, payload_size);
             if (ComputeCrc32(payload) != checksum)
                 throw std::runtime_error("Raft snapshot checksum mismatch");
@@ -697,6 +719,9 @@ private:
         legacy.read(reinterpret_cast<char *>(&count), sizeof(count));
         if (!legacy || count > 10000000)
             throw std::runtime_error("invalid Raft snapshot header");
+        if (snapshot_last_index < 0 || snapshot_last_term < 0 ||
+            snapshot_last_term > snapshot_last_index)
+            throw std::runtime_error("invalid legacy Raft snapshot metadata");
 
         for (std::uint32_t i = 0; i < count; ++i)
         {
@@ -1378,9 +1403,18 @@ public:
                 if (entry.key().size() > kMaxKeyBytes || entry.value().size() > kMaxValueBytes ||
                     entry.request_id().size() > kMaxRequestIdBytes)
                     return Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "replicated entry exceeds configured size limits");
+                if (entry.term() < 0 || entry.term() > request->leader_term())
+                    return Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                  "AppendEntries entry term is outside the leader term");
             }
-            if (request->prev_log_index() < -1 || request->leader_commit() < -1)
+            if (request->leader_term() < 0 || request->prev_log_index() < -1 ||
+                request->prev_log_index() == std::numeric_limits<int>::max() ||
+                request->prev_log_term() < 0 || request->leader_commit() < -1)
                 return Status(grpc::StatusCode::INVALID_ARGUMENT, "AppendEntries contains a negative Raft index");
+            if (request->prev_log_index() >= 0 &&
+                request->entries_size() >
+                    std::numeric_limits<int>::max() - request->prev_log_index())
+                return Status(grpc::StatusCode::INVALID_ARGUMENT, "AppendEntries index range overflows");
             if (request->leader_term() > current_term)
             {
                 current_term = request->leader_term();
@@ -1481,6 +1515,11 @@ public:
     {
         if (request->leader_id() != node_id && !IsConfiguredPeer(request->leader_id()))
             return Status(grpc::StatusCode::PERMISSION_DENIED, "snapshot sender is not a configured peer");
+        if (request->leader_term() < 0 || request->last_included_index() < 0 ||
+            request->last_included_index() == std::numeric_limits<int>::max() ||
+            request->last_included_term() < 0 ||
+            request->last_included_term() > request->leader_term())
+            return Status(grpc::StatusCode::INVALID_ARGUMENT, "snapshot contains invalid Raft metadata");
 
         SnapshotState snapshot;
         try
@@ -1985,7 +2024,7 @@ public:
     }
 };
 
-void RunServer(const std::string &port, const std::vector<std::string> &peer_addresses,
+bool RunServer(const std::string &port, const std::vector<std::string> &peer_addresses,
                const std::vector<int> &peer_ids, const TlsConfig &tls_config,
                const std::filesystem::path &membership_path,
                const std::filesystem::path &data_root)
@@ -2022,11 +2061,12 @@ void RunServer(const std::string &port, const std::vector<std::string> &peer_add
     {
         std::cerr << "Failed to start server on " << server_address
                   << " - the port may already be in use." << std::endl;
-        return;
+        return false;
     }
 
     std::cout << "Server listening on " << server_address << " [starting as FOLLOWER]" << std::endl;
     server->Wait();
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -2061,12 +2101,22 @@ int main(int argc, char **argv)
     tls_config.ca_file = runtime_config.ca_file;
     tls_config.certificate_file = runtime_config.certificate_file;
     tls_config.private_key_file = runtime_config.private_key_file;
+    bool invalid_peer_endpoint = false;
 
     auto add_peer = [&](const std::string &peer) {
         const auto separator = peer.rfind(':');
         const auto address = separator == std::string::npos ? "localhost:" + peer : peer;
-        peer_addresses.push_back(address);
-        peer_ids.push_back(separator == std::string::npos ? std::stoi(peer) : std::stoi(peer.substr(separator + 1)));
+        try
+        {
+            const auto port_text = separator == std::string::npos ? peer : peer.substr(separator + 1);
+            peer_ids.push_back(ParsePortNumber(port_text, "peer"));
+            peer_addresses.push_back(address);
+        }
+        catch (const std::exception &error)
+        {
+            std::cerr << "Invalid peer endpoint '" << peer << "': " << error.what() << std::endl;
+            invalid_peer_endpoint = true;
+        }
     };
     for (const auto &peer : runtime_config.peers)
         add_peer(peer);
@@ -2118,8 +2168,29 @@ int main(int argc, char **argv)
         add_peer(argv[i]);
     }
 
+    if (invalid_peer_endpoint)
+        return 2;
+
+    if (tls_config.Configured() && !tls_config.Enabled())
+    {
+        std::cerr << "TLS requires --ca, --cert, and --key to be configured together." << std::endl;
+        return 2;
+    }
+
+    RuntimeConfig effective_config = runtime_config;
+    effective_config.port = port;
+    effective_config.peers = peer_addresses;
+    try
+    {
+        ValidateRuntimeConfig(effective_config);
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << "Invalid server configuration: " << error.what() << std::endl;
+        return 2;
+    }
+
     if (tls_config.Enabled())
         std::cout << "TLS/mTLS enabled" << std::endl;
-    RunServer(port, peer_addresses, peer_ids, tls_config, membership_path, data_root);
-    return 0;
+    return RunServer(port, peer_addresses, peer_ids, tls_config, membership_path, data_root) ? 0 : 1;
 }

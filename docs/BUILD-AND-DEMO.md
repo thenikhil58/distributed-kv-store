@@ -9,6 +9,11 @@ automated test instructions, and the dashboard workflow, see [the testing guide]
 - [Git](https://git-scm.com/)
 - ~5 GB of free disk space (for the compiler toolchain and gRPC dependencies)
 
+> **Platform status:** The server's persistence code currently uses POSIX APIs
+> (`fsync`, `unistd.h`, and `O_DIRECTORY`). Native MSVC builds are therefore not
+> a supported target yet; these Windows instructions are an aspirational setup
+> guide and have not been validated against the current source.
+
 ## 1. Install a C++ Compiler
 
 Download **Build Tools for Visual Studio** from the [Visual Studio downloads page](https://visualstudio.microsoft.com/downloads/) (under "Tools for Visual Studio" — this installs just the compiler and build tools, not the full IDE).
@@ -137,6 +142,11 @@ the client:
 .\build\Debug\server.exe 50051 50052 50053 --ca ca.pem --cert node-50051.pem --key node-50051-key.pem
 .\build\Debug\client.exe --address localhost:50051 --ca ca.pem --cert client.pem --key client-key.pem
 ```
+
+The server requires all three TLS options together. If any TLS option is supplied without
+the other two, startup fails instead of silently falling back to plaintext. If none are
+supplied, gRPC remains unauthenticated and unencrypted; keep that mode on a trusted local
+network only.
 
 Outbound peer endpoints can be reloaded without restarting a node. Pass `--peers-file` and keep one
 `host:port` endpoint per line; editing the file updates the peer stubs. This is not Raft joint

@@ -233,6 +233,22 @@ class GatewayHttpTests(unittest.TestCase):
         self.assertEqual(status, 429)
         self.assertIn("rate limit", json.loads(body)["error"].lower())
 
+    def test_metrics_include_http_method_and_response_status(self):
+        client = self.client()
+        self.assertEqual(self.login(client, "alice", "alice-password-123")[0], 200)
+        self.assertEqual(self.request(client, "/api/keys")[0], 200)
+        status, _, body = self.request(client, "/metrics")
+        self.assertEqual(status, 200)
+        metrics = body.decode("utf-8")
+        self.assertIn(
+            'kvstore_http_responses_total{method="GET",status="200"}',
+            metrics,
+        )
+        self.assertIn(
+            'kvstore_http_responses_total{method="POST",status="200"}',
+            metrics,
+        )
+
     def test_login_and_mutation_are_audited(self):
         with tempfile.TemporaryDirectory() as directory:
             audit_path = gateway.Path(directory) / "audit.log"

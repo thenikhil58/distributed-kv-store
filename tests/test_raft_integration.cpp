@@ -728,6 +728,60 @@ TEST(RaftIntegration, EmptyAppendEntriesPreservesMatchingSuffix) {
     EXPECT_EQ(append_response.match_index(), cluster_response.commit_index());
 }
 
+TEST(RaftIntegration, RejectsAppendEntriesWithFutureEntryTerm) {
+    const std::string port = "18071";
+    const std::string address = "localhost:" + port;
+    TestServer server(port);
+    ASSERT_GT(server.pid, 0);
+    ASSERT_TRUE(WaitForServer(address));
+    ASSERT_TRUE(WaitForLeader(address));
+
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub stub(channel);
+    kvstore::ClusterStatusRequest status_request;
+    kvstore::ClusterStatusResponse status_response;
+    grpc::ClientContext status_context;
+    ASSERT_TRUE(stub.GetClusterStatus(&status_context, status_request, &status_response).ok());
+
+    kvstore::AppendEntriesRequest append_request;
+    append_request.set_leader_term(status_response.current_term());
+    append_request.set_leader_id(std::stoi(port));
+    append_request.set_prev_log_index(status_response.commit_index());
+    append_request.set_prev_log_term(status_response.current_term());
+    append_request.add_entries()->set_term(status_response.current_term() + 1);
+    kvstore::AppendEntriesResponse append_response;
+    grpc::ClientContext append_context;
+    const auto status = stub.AppendEntries(&append_context, append_request, &append_response);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+TEST(RaftIntegration, RejectsSnapshotWithNegativeIncludedIndex) {
+    const std::string port = "18072";
+    const std::string address = "localhost:" + port;
+    TestServer server(port);
+    ASSERT_GT(server.pid, 0);
+    ASSERT_TRUE(WaitForServer(address));
+    ASSERT_TRUE(WaitForLeader(address));
+
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub stub(channel);
+    kvstore::ClusterStatusRequest status_request;
+    kvstore::ClusterStatusResponse status_response;
+    grpc::ClientContext status_context;
+    ASSERT_TRUE(stub.GetClusterStatus(&status_context, status_request, &status_response).ok());
+
+    kvstore::InstallSnapshotRequest snapshot_request;
+    snapshot_request.set_leader_term(status_response.current_term());
+    snapshot_request.set_leader_id(std::stoi(port));
+    snapshot_request.set_last_included_index(-1);
+    snapshot_request.set_last_included_term(0);
+    snapshot_request.set_done(true);
+    kvstore::InstallSnapshotResponse snapshot_response;
+    grpc::ClientContext snapshot_context;
+    const auto status = stub.InstallSnapshot(&snapshot_context, snapshot_request, &snapshot_response);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
 uint32_t ComputeCrc32ForTest(const std::string &payload) {
     constexpr std::uint32_t polynomial = 0xEDB88320u;
     std::uint32_t crc = 0xFFFFFFFFu;
@@ -873,6 +927,133 @@ TEST(RaftIntegration, CompactsCommittedLogIntoSnapshot) {
     }
 
     EXPECT_TRUE(std::filesystem::exists(data_path / "raft.snapshot"));
+}
+
+TEST(RaftIntegration, RejectsCorruptSnapshotOnStartup) {
+    const std::string port = "18073";
+    const auto data_path = std::filesystem::path("data") / ("node_" + port);
+    std::error_code error;
+    std::filesystem::remove_all(data_path, error);
+    std::filesystem::create_directories(data_path);
+    {
+        std::ofstream snapshot(data_path / "raft.snapshot", std::ios::binary);
+        snapshot.write("RKVSNP01", 8);
+        const int index = 12;
+        const int term = 3;
+        const std::uint32_t payload_size = 1;
+        const std::uint32_t checksum = 0;
+        snapshot.write(reinterpret_cast<const char*>(&index), sizeof(index));
+        snapshot.write(reinterpret_cast<const char*>(&term), sizeof(term));
+        snapshot.write(reinterpret_cast<const char*>(&payload_size), sizeof(payload_size));
+        snapshot.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
+        snapshot.put('x');
+    }
+
+    const pid_t pid = StartServer(port, {});
+    ASSERT_GT(pid, 0);
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    int status = 0;
+    EXPECT_GT(waitpid(pid, &status, WNOHANG), 0);
+}
+
+TEST(RaftIntegration, RejectsInvalidMetadataOnStartup) {
+    const std::string port = "18074";
+    const auto data_path = std::filesystem::path("data") / ("node_" + port);
+    std::error_code error;
+    std::filesystem::remove_all(data_path, error);
+    std::filesystem::create_directories(data_path);
+    {
+        std::ofstream metadata(data_path / "raft.meta", std::ios::trunc);
+        metadata << "-1 0\n";
+    }
+
+    const pid_t pid = StartServer(port, {});
+    ASSERT_GT(pid, 0);
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    int status = 0;
+    EXPECT_GT(waitpid(pid, &status, WNOHANG), 0);
+}
+
+TEST(RaftIntegration, TruncatedWALTailIsTruncatedAndValidPrefixSurvives) {
+    const std::string port = "18075";
+    const std::string address = "localhost:" + port;
+    const auto data_path = std::filesystem::path("data") / ("node_" + port);
+
+    {
+        TestServer server(port);
+        ASSERT_GT(server.pid, 0);
+        ASSERT_TRUE(WaitForServer(address));
+        ASSERT_TRUE(WaitForLeader(address));
+
+        auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+        kvstore::KVStore::Stub stub(channel);
+        kvstore::SetRequest request;
+        request.set_key("truncated-wal-prefix");
+        request.set_value("must-survive");
+        request.set_request_id("truncated-wal-prefix");
+        kvstore::SetResponse response;
+        grpc::ClientContext context;
+        ASSERT_TRUE(stub.Set(&context, request, &response).ok());
+        ASSERT_TRUE(response.success());
+    }
+
+    {
+        std::ofstream wal(data_path / "raft.wal", std::ios::binary | std::ios::app);
+        wal.write("bad-tail", 8);
+    }
+
+    TestServer restarted(port, false);
+    ASSERT_GT(restarted.pid, 0);
+    ASSERT_TRUE(WaitForServer(address));
+
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub stub(channel);
+    kvstore::GetRequest request;
+    request.set_key("truncated-wal-prefix");
+    kvstore::GetResponse response;
+    grpc::ClientContext context;
+    ASSERT_TRUE(stub.Get(&context, request, &response).ok());
+    ASSERT_TRUE(response.found());
+    EXPECT_EQ(response.value(), "must-survive");
+}
+
+TEST(RaftIntegration, RepeatedRestartPreservesAcknowledgedWrites) {
+    const std::string port = "18076";
+    const std::string address = "localhost:" + port;
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        TestServer server(port, cycle == 0);
+        ASSERT_GT(server.pid, 0);
+        ASSERT_TRUE(WaitForServer(address));
+        ASSERT_TRUE(WaitForLeader(address));
+
+        auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+        kvstore::KVStore::Stub stub(channel);
+        kvstore::SetRequest request;
+        request.set_key("restart-cycle-" + std::to_string(cycle));
+        request.set_value("durable");
+        request.set_request_id("restart-cycle-" + std::to_string(cycle));
+        kvstore::SetResponse response;
+        grpc::ClientContext context;
+        ASSERT_TRUE(stub.Set(&context, request, &response).ok());
+        ASSERT_TRUE(response.success());
+    }
+
+    TestServer final_server(port, false);
+    ASSERT_GT(final_server.pid, 0);
+    ASSERT_TRUE(WaitForServer(address));
+
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub stub(channel);
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        kvstore::GetRequest request;
+        request.set_key("restart-cycle-" + std::to_string(cycle));
+        kvstore::GetResponse response;
+        grpc::ClientContext context;
+        ASSERT_TRUE(stub.Get(&context, request, &response).ok());
+        ASSERT_TRUE(response.found());
+        EXPECT_EQ(response.value(), "durable");
+    }
 }
 
 }  // namespace

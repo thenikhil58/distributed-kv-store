@@ -1,6 +1,8 @@
 #include "runtime_config.h"
 
+#include <charconv>
 #include <fstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -52,7 +54,52 @@ void Assign(RuntimeConfig &config, const std::string &key, const std::string &va
         throw std::runtime_error("unknown runtime config key: " + key);
 }
 
+int ParsePort(const std::string &value, const std::string &field)
+{
+    int port = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), port);
+    if (result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
+        port < 1 || port > 65535)
+        throw std::runtime_error("invalid " + field + " port: " + value);
+    return port;
+}
+
+int PeerPort(const std::string &peer)
+{
+    const auto separator = peer.rfind(':');
+    const auto port_text = separator == std::string::npos ? peer : peer.substr(separator + 1);
+    if (separator != std::string::npos && separator == 0)
+        throw std::runtime_error("invalid peer endpoint: " + peer);
+    return ParsePort(port_text, "peer");
+}
+
 } // namespace
+
+int ParsePortNumber(const std::string &value, const std::string &field)
+{
+    return ParsePort(value, field);
+}
+
+void ValidateRuntimeConfig(const RuntimeConfig &config)
+{
+    const int node_port = config.port.empty() ? 0 : ParsePort(config.port, "node");
+    std::set<int> peer_ports;
+    for (const auto &peer : config.peers)
+    {
+        const int peer_port = PeerPort(peer);
+        if (peer_port == node_port)
+            throw std::runtime_error("peer endpoint must not refer to the local node: " + peer);
+        if (!peer_ports.insert(peer_port).second)
+            throw std::runtime_error("duplicate peer node port: " + std::to_string(peer_port));
+    }
+
+    const bool any_tls = !config.ca_file.empty() || !config.certificate_file.empty() ||
+                         !config.private_key_file.empty();
+    const bool complete_tls = !config.ca_file.empty() && !config.certificate_file.empty() &&
+                              !config.private_key_file.empty();
+    if (any_tls && !complete_tls)
+        throw std::runtime_error("ca, cert, and key must be configured together");
+}
 
 RuntimeConfig LoadRuntimeConfig(const std::filesystem::path &path)
 {
@@ -79,9 +126,6 @@ RuntimeConfig LoadRuntimeConfig(const std::filesystem::path &path)
             throw std::runtime_error("invalid runtime config at line " + std::to_string(line_number));
         Assign(config, key, value);
     }
-    const bool any_tls = !config.ca_file.empty() || !config.certificate_file.empty() || !config.private_key_file.empty();
-    const bool complete_tls = !config.ca_file.empty() && !config.certificate_file.empty() && !config.private_key_file.empty();
-    if (any_tls && !complete_tls)
-        throw std::runtime_error("ca, cert, and key must be configured together");
+    ValidateRuntimeConfig(config);
     return config;
 }

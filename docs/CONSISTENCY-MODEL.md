@@ -18,6 +18,8 @@ WAL and metadata writes are flushed and synchronized before acknowledgement. Thi
 depends on the operating system, filesystem, storage device, and their honoring
 `fsync`; it does not protect against arbitrary hardware that lies about durable
 writes, loss of a majority, or operator deletion/corruption of data.
+The persistence implementation uses POSIX file operations; no specific filesystem
+or power-loss behavior has been qualified. There is no published RPO or RTO.
 
 Providing a non-empty `request_id` makes a retry of the same request return its
 original result, including after restart and snapshot recovery. The caller must
@@ -38,6 +40,14 @@ same-term quorum round trip without model checking and fault-injection evidence.
 `EVENTUAL` reads may be served from a follower's locally applied state. They can
 be stale by an unbounded amount during a partition or while a node catches up.
 
+## Phase 1 deployment boundary
+
+There is no established availability target, RTO, or RPO. The only published
+capacity limits are per-operation input limits: 4 KiB keys, 1 MiB values, and 256-byte
+request or client IDs. Aggregate keyspace, disk usage, and write rate have no
+qualified limits. Benchmark throughput and latency measurements describe the test
+conditions only and must not be interpreted as a production support contract.
+
 ## Membership and security boundaries
 
 The voting membership is static. Reloading a peer file changes outbound
@@ -51,4 +61,5 @@ network.
 Snapshots include a format marker and CRC-protected protobuf payload. The reader
 continues to accept the earlier unversioned snapshot and WAL formats for local
 development. Keep a backup before upgrading data files; there is no supported
-rolling on-disk or wire-format upgrade procedure yet.
+rolling on-disk or wire-format upgrade procedure yet. Do not mix server versions
+in a cluster or downgrade binaries against data written by a newer version.

@@ -101,7 +101,9 @@ ctest --test-dir build --output-on-failure
 The C++ suite currently includes:
 
 - `runtime_config_tests`: configuration parsing, invalid values, comments, and TLS validation
-- `raft_tests`: multi-node startup, leader election, replication, persistence, failover, and follower forwarding behavior
+- `raft_tests`: multi-node startup, leader election, replication, persistence, failover,
+  follower forwarding, malformed Raft metadata rejection, corrupt snapshot startup
+  rejection, truncated WAL-tail recovery, and repeated acknowledged-write restarts
 
 Run one test target directly when debugging:
 
@@ -300,6 +302,11 @@ Build benchmarks with `-DBUILD_BENCHMARKS=ON`, then run the benchmark against a 
 ```bash
 ./build/kvstore_benchmark localhost:50051 1000
 ```
+
+The benchmark prints sequential write throughput and operation latency percentiles.
+Record the result with the commit, build type, cluster size, hardware, storage, network,
+and run conditions. These measurements are not an established capacity or latency
+guarantee.
 
 The first argument is the gRPC address and the second is the number of operations.
 
