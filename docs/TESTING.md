@@ -22,7 +22,7 @@ On Ubuntu/Debian, the package names are commonly:
 sudo apt update
 sudo apt install -y build-essential cmake pkg-config \
   libgrpc++-dev libprotobuf-dev protobuf-compiler \
-  protobuf-compiler-grpc libgtest-dev python3 python3-pip curl
+  protobuf-compiler-grpc libgtest-dev libssl-dev python3 python3-pip curl
 ```
 
 If the machine uses vcpkg, configure CMake with the vcpkg toolchain file instead of installing the C++ dependencies from the OS packages.
@@ -137,32 +137,32 @@ Open three terminals from the project root.
 Terminal 1:
 
 ```bash
-./build/server 50051 50052 50053
+./build/server 50051 50052 50053 --insecure-dev
 ```
 
 Terminal 2:
 
 ```bash
-./build/server 50052 50051 50053
+./build/server 50052 50051 50053 --insecure-dev
 ```
 
 Terminal 3:
 
 ```bash
-./build/server 50053 50051 50052
+./build/server 50053 50051 50052 --insecure-dev
 ```
 
 Wait until one node reports:
 
 ```text
-*** BECAME LEADER ***
+{"event":"raft_leader_elected"}
 ```
 
 The nodes persist state under `data/node_<port>/`. For a disposable manual run, use a separate data root:
 
 ```bash
 rm -rf /tmp/kvstore-manual
-./build/server 50051 50052 50053 --data-root /tmp/kvstore-manual
+./build/server 50051 50052 50053 --data-root /tmp/kvstore-manual --insecure-dev
 ```
 
 ## 7. Run the Complete Dashboard Stack
@@ -300,7 +300,7 @@ curl -i -X DELETE 'http://127.0.0.1:8080/api/entry?key=hello'
 Build benchmarks with `-DBUILD_BENCHMARKS=ON`, then run the benchmark against a running node:
 
 ```bash
-./build/kvstore_benchmark localhost:50051 1000
+./build/kvstore_benchmark localhost:50051 1000 --insecure-dev
 ```
 
 The benchmark prints sequential write throughput and operation latency percentiles.
@@ -362,7 +362,7 @@ https://<forwarded-dashboard-host>/?api=https://<forwarded-gateway-host>
 Start the gateway with the dashboard origin explicitly allowed:
 
 ```bash
-python3 gateway.py --target localhost:50051 --port 8080 --allowed-origin https://<forwarded-dashboard-host>
+python3 gateway.py --target localhost:50051 --port 8080 --allowed-origin https://<forwarded-dashboard-host> --insecure-dev
 ```
 
 The gateway must be forwarded publicly or privately according to the environment's security settings. Do not expose a development gateway publicly without authentication or network restrictions.
@@ -383,6 +383,11 @@ To start the default stack again:
 ./start.sh
 ```
 
+`start.sh` is a loopback-only plaintext development demo. Normal server, client, and
+gateway invocations require mTLS and gRPC role tokens; use the [security guide](SECURITY.md)
+for provisioning and lifecycle instructions. The `--insecure-dev` flag must never be
+used for remotely reachable addresses.
+
 ## 13. Troubleshooting
 
 ### Gateway offline in the dashboard
@@ -396,7 +401,7 @@ curl -i http://127.0.0.1:8080/api/health
 If it is not reachable, start it manually on the loopback interface:
 
 ```bash
-python3 gateway.py --host 127.0.0.1 --target localhost:50051 --port 8080
+python3 gateway.py --host 127.0.0.1 --target localhost:50051 --port 8080 --insecure-dev
 ```
 
 For trusted private-network exposure, add `--allow-public` and a users file or `GATEWAY_ALLOW_PUBLIC=1` plus `GATEWAY_SESSION_SECRET` with `USERS_FILE`.

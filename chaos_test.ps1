@@ -9,7 +9,7 @@ $processes = @{}
 function Start-Node($port) {
     $peers = $ports | Where-Object { $_ -ne $port }
     $peerArgs = $peers -join " "
-    $proc = Start-Process -FilePath $exePath -ArgumentList "$port $peerArgs" -PassThru -WindowStyle Normal
+    $proc = Start-Process -FilePath $exePath -ArgumentList "$port $peerArgs --insecure-dev" -PassThru -WindowStyle Normal
     $processes[$port] = $proc
     Write-Host "Started node $port (PID: $($proc.Id))" -ForegroundColor Green
 }

@@ -1,13 +1,36 @@
 #include <chrono>
 #include <cstdlib>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
 
 #include "../kvstore.grpc.pb.h"
+
+namespace {
+
+std::string ReadFile(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to read credential file: " + path);
+    }
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+bool IsLoopback(const std::string& address) {
+    const auto separator = address.rfind(':');
+    const auto host = separator == std::string::npos ? address : address.substr(0, separator);
+    return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+}
+
+} // namespace
 
 int main(int argc, char **argv)
 {
@@ -19,7 +42,75 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    std::string ca_file;
+    std::string certificate_file;
+    std::string private_key_file;
+    std::string token_file;
+    bool insecure_dev = false;
+    for (int index = 3; index < argc; ++index) {
+        const std::string option = argv[index];
+        if (option == "--ca" && index + 1 < argc) {
+            ca_file = argv[++index];
+        } else if (option == "--cert" && index + 1 < argc) {
+            certificate_file = argv[++index];
+        } else if (option == "--key" && index + 1 < argc) {
+            private_key_file = argv[++index];
+        } else if (option == "--token-file" && index + 1 < argc) {
+            token_file = argv[++index];
+        } else if (option == "--insecure-dev") {
+            insecure_dev = true;
+        } else {
+            std::cerr << "invalid or incomplete option: " << option << '\n';
+            return 2;
+        }
+    }
+
+    const bool any_tls = !ca_file.empty() || !certificate_file.empty() || !private_key_file.empty();
+    const bool complete_tls = !ca_file.empty() && !certificate_file.empty() && !private_key_file.empty();
+    if (any_tls != complete_tls || complete_tls != !token_file.empty()) {
+        std::cerr << "--ca, --cert, --key, and --token-file must be provided together\n";
+        return 2;
+    }
+    if (insecure_dev && !IsLoopback(address)) {
+        std::cerr << "--insecure-dev is restricted to loopback addresses\n";
+        return 2;
+    }
+    if (!insecure_dev && !complete_tls) {
+        std::cerr << "mTLS and --token-file are required; use --insecure-dev only for local development\n";
+        return 2;
+    }
+
+    std::shared_ptr<grpc::ChannelCredentials> credentials;
+    try {
+        if (complete_tls) {
+            grpc::SslCredentialsOptions options;
+            options.pem_root_certs = ReadFile(ca_file);
+            options.pem_cert_chain = ReadFile(certificate_file);
+            options.pem_private_key = ReadFile(private_key_file);
+            credentials = grpc::SslCredentials(options);
+            const auto permissions = std::filesystem::status(token_file).permissions();
+            if ((permissions & (std::filesystem::perms::group_all |
+                                std::filesystem::perms::others_all)) != std::filesystem::perms::none) {
+                throw std::runtime_error("token file must have mode 0600 or stricter");
+            }
+            auto token = ReadFile(token_file);
+            while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) {
+                token.pop_back();
+            }
+            if (token.size() < 32) {
+                throw std::runtime_error("token file must contain at least 32 bytes");
+            }
+            credentials = grpc::CompositeChannelCredentials(
+                credentials, grpc::AccessTokenCredentials(token));
+        } else {
+            credentials = grpc::InsecureChannelCredentials();
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "failed to load credentials: " << error.what() << '\n';
+        return 2;
+    }
+
+    auto channel = grpc::CreateChannel(address, credentials);
     auto stub = kvstore::KVStore::NewStub(channel);
     std::vector<double> latencies;
     latencies.reserve(static_cast<std::size_t>(operations));

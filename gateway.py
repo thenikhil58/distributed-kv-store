@@ -7,10 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
 import json
+import logging
 import os
 import pathlib
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,12 +38,35 @@ REQUEST_COUNTERS = {
     "auth_failure": 0,
 }
 HTTP_RESPONSE_COUNTERS = {}
+HTTP_RESPONSE_LATENCIES = {}
+HTTP_LATENCY_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
 PASSWORD_ITERATIONS = 310_000
 SESSION_COOKIE = "raft_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
+MAX_HTTP_WORKERS = 64
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 5
+LOGGER = logging.getLogger("raft_kv_gateway")
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "timestamp_unix_ms": int(record.created * 1000),
+            "level": record.levelname.lower(),
+            "event": getattr(record, "event", record.getMessage()),
+            "fields": getattr(record, "fields", {}),
+        }, sort_keys=True)
+
+
+def configure_logging(level):
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter())
+    LOGGER.handlers.clear()
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel("WARNING" if level == "warn" else level.upper())
+    LOGGER.propagate = False
 
 
 def create_password_record(password):
@@ -134,6 +159,21 @@ def validate_gateway_security(host, users_file, allow_public=False):
 
 def read_text(path):
     return pathlib.Path(path).read_text(encoding="utf-8")
+
+
+def read_secret(path):
+    secret_path = Path(path)
+    if os.name == "posix" and secret_path.stat().st_mode & 0o077:
+        raise ValueError(f"token file must be private (chmod 600): {path}")
+    token = secret_path.read_text(encoding="utf-8").rstrip("\r\n")
+    if len(token.encode("utf-8")) < 32:
+        raise ValueError("token file must contain at least 32 bytes")
+    return token
+
+
+def is_loopback_target(target):
+    host = target.rsplit(":", 1)[0].strip("[]").lower()
+    return host in {"localhost", "127.0.0.1", "::1"}
 
 
 def load_generated_client():
@@ -249,9 +289,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def send_response(self, code, message=None):
         super().send_response(code, message)
+        self._response_status = code
         key = (self.command or "unknown", code)
         with self._metrics_lock:
             HTTP_RESPONSE_COUNTERS[key] = HTTP_RESPONSE_COUNTERS.get(key, 0) + 1
+
+    def handle_one_request(self):
+        started = time.perf_counter()
+        self._response_status = 0
+        try:
+            super().handle_one_request()
+        finally:
+            if self._response_status:
+                elapsed = time.perf_counter() - started
+                key = (self.command or "unknown", self._response_status)
+                with self._metrics_lock:
+                    metric = HTTP_RESPONSE_LATENCIES.setdefault(
+                        key, {"count": 0, "sum": 0.0, "buckets": [0] * len(HTTP_LATENCY_BUCKETS)}
+                    )
+                    metric["count"] += 1
+                    metric["sum"] += elapsed
+                    for index, boundary in enumerate(HTTP_LATENCY_BUCKETS):
+                        if elapsed <= boundary:
+                            metric["buckets"][index] += 1
 
     def _send(self, status, payload, headers=()):
         body = json.dumps(payload).encode("utf-8")
@@ -325,6 +385,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             with self._metrics_lock:
                 counters = REQUEST_COUNTERS.copy()
                 response_counters = HTTP_RESPONSE_COUNTERS.copy()
+                latency_metrics = {
+                    key: {
+                        "count": value["count"],
+                        "sum": value["sum"],
+                        "buckets": value["buckets"][:],
+                    }
+                    for key, value in HTTP_RESPONSE_LATENCIES.items()
+                }
             for method, count in counters.items():
                 lines.append(f'kvstore_requests_total{{method="{method}"}} {count}')
             lines.extend([
@@ -334,6 +402,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
             for (method, status), count in sorted(response_counters.items()):
                 lines.append(
                     f'kvstore_http_responses_total{{method="{method}",status="{status}"}} {count}'
+                )
+            lines.extend([
+                "# HELP kvstore_http_request_duration_seconds Gateway HTTP handler duration.",
+                "# TYPE kvstore_http_request_duration_seconds histogram",
+            ])
+            for (method, status), metric in sorted(latency_metrics.items()):
+                for index, boundary in enumerate(HTTP_LATENCY_BUCKETS):
+                    lines.append(
+                        f'kvstore_http_request_duration_seconds_bucket{{method="{method}",status="{status}",le="{boundary}"}} '
+                        f'{metric["buckets"][index]}'
+                    )
+                lines.append(
+                    f'kvstore_http_request_duration_seconds_bucket{{method="{method}",status="{status}",le="+Inf"}} '
+                    f'{metric["count"]}'
+                )
+                lines.append(
+                    f'kvstore_http_request_duration_seconds_sum{{method="{method}",status="{status}"}} '
+                    f'{metric["sum"]}'
+                )
+                lines.append(
+                    f'kvstore_http_request_duration_seconds_count{{method="{method}",status="{status}"}} '
+                    f'{metric["count"]}'
                 )
             body = "\n".join(lines) + "\n"
             self.send_response(200)
@@ -621,7 +711,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._delete_entry(username, key)
 
     def log_message(self, format, *args):
-        print(f"[gateway] {self.address_string()} - {format % args}")
+        LOGGER.info(
+            "http_request",
+            extra={
+                "event": "gateway_http_request",
+                "fields": {
+                    "remote_ip": self.client_address[0],
+                    "method": self.command or "unknown",
+                    "path": urlparse(self.path).path,
+                    "status": getattr(self, "_response_status", 0),
+                },
+            },
+        )
 
     def _read_node_status(self, node):
         address, stub = node
@@ -639,6 +740,36 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return {"address": address, "node_id": -1, "reachable": False, "is_leader": False}
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    def __init__(self, server_address, request_handler):
+        super().__init__(server_address, request_handler)
+        self._request_slots = threading.BoundedSemaphore(MAX_HTTP_WORKERS)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 def main():
     parser = argparse.ArgumentParser(description="HTTP gateway for the Raft KVStore")
     parser.add_argument("--target", default="localhost:50051", help="gRPC node address")
@@ -654,7 +785,12 @@ def main():
     parser.add_argument("--ca", help="CA certificate for mTLS")
     parser.add_argument("--cert", help="client certificate for mTLS")
     parser.add_argument("--key", help="client private key for mTLS")
+    parser.add_argument("--token-file", help="private file containing the gRPC bearer token")
+    parser.add_argument("--insecure-dev", action="store_true", help="allow plaintext gRPC only to loopback nodes for local development")
+    parser.add_argument("--log-level", choices=("debug", "info", "warn", "error"),
+                        default=os.environ.get("KV_LOG_LEVEL", "info").lower())
     args = parser.parse_args()
+    configure_logging(args.log_level)
     if bool(args.https_cert) != bool(args.https_key):
         parser.error("--https-cert and --https-key must be provided together")
     if args.https_cert:
@@ -691,15 +827,30 @@ def main():
     tls_files = (args.ca, args.cert, args.key)
     if any(tls_files) and not all(tls_files):
         parser.error("--ca, --cert, and --key must be provided together")
-    if all(tls_files):
-        credentials = grpc.ssl_channel_credentials(
-            root_certificates=read_text(args.ca).encode(),
-            certificate_chain=read_text(args.cert).encode(),
-            private_key=read_text(args.key).encode(),
-        )
-        channel = grpc.secure_channel(args.target, credentials)
-    else:
-        channel = grpc.insecure_channel(args.target)
+    if all(tls_files) != bool(args.token_file):
+        if not (args.insecure_dev and not any(tls_files) and not args.token_file):
+            parser.error("mTLS credentials and --token-file are required together")
+    if not args.insecure_dev and not all(tls_files):
+        parser.error("mTLS and --token-file are required; use --insecure-dev only for local development")
+    if args.insecure_dev and any(
+        not is_loopback_target(address) for address in [args.target, *args.node]
+    ):
+        parser.error("--insecure-dev is restricted to loopback gRPC targets")
+    try:
+        if all(tls_files):
+            credentials = grpc.ssl_channel_credentials(
+                root_certificates=read_text(args.ca).encode(),
+                certificate_chain=read_text(args.cert).encode(),
+                private_key=read_text(args.key).encode(),
+            )
+            token = read_secret(args.token_file)
+            call_credentials = grpc.access_token_call_credentials(token)
+            credentials = grpc.composite_channel_credentials(credentials, call_credentials)
+            channel = grpc.secure_channel(args.target, credentials)
+        else:
+            channel = grpc.insecure_channel(args.target)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     GatewayHandler.pb2 = pb2
     GatewayHandler.stub = pb2_grpc.KVStoreStub(channel)
     GatewayHandler.allowed_origins = dashboard_origins().union(args.allowed_origin)
@@ -712,7 +863,7 @@ def main():
         node_channel = grpc.secure_channel(address, credentials) if all(tls_files) else grpc.insecure_channel(address)
         channels.append(node_channel)
         node_stubs.append((address, pb2_grpc.KVStoreStub(node_channel)))
-    server = ThreadingHTTPServer((args.host, args.port), GatewayHandler)
+    server = BoundedThreadingHTTPServer((args.host, args.port), GatewayHandler)
     server.target = args.target
     server.node_stubs = node_stubs
     server.secure_transport = bool(args.https_cert)
@@ -723,12 +874,36 @@ def main():
         tls_context.load_cert_chain(args.https_cert, args.https_key)
         server.socket = tls_context.wrap_socket(server.socket, server_side=True)
     scheme = "https" if args.https_cert else "http"
-    print(f"KV gateway listening on {scheme}://{args.host}:{args.port} -> {args.target}")
+    LOGGER.info(
+        "gateway_listener_started",
+        extra={
+            "event": "gateway_listener_started",
+            "fields": {
+                "scheme": scheme,
+                "host": args.host,
+                "port": args.port,
+                "grpc_target": args.target,
+            },
+        },
+    )
+    shutdown_requested = threading.Event()
+    signal.signal(signal.SIGINT, lambda signum, frame: shutdown_requested.set())
+    signal.signal(signal.SIGTERM, lambda signum, frame: shutdown_requested.set())
+
+    def stop_server():
+        shutdown_requested.wait()
+        LOGGER.info("gateway_shutdown_started", extra={"event": "gateway_shutdown_started"})
+        server.shutdown()
+
+    shutdown_thread = threading.Thread(target=stop_server, daemon=True)
+    shutdown_thread.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        shutdown_requested.set()
+        shutdown_thread.join()
         server.server_close()
         for open_channel in channels:
             open_channel.close()

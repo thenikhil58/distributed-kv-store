@@ -2,7 +2,7 @@
 
 ## Current status
 
-This repository is an experimental distributed key-value store and is **not yet ready for production data**. It has a runnable C++/gRPC Raft cluster, persistent log and metadata, snapshots, a browser gateway, optional mutual TLS, and automated tests. Those features are a starting point, not evidence of production-grade safety, availability, or support.
+This repository is an experimental distributed key-value store and is **not yet ready for production data**. It has a runnable C++/gRPC Raft cluster, persistent log and metadata, snapshots, a browser gateway, mTLS and role-authorized gRPC access for secured deployments, and automated tests. Those features are a starting point, not evidence of production-grade safety, availability, or support.
 
 ## Progress tracker
 
@@ -16,10 +16,10 @@ or independently backed-up data.
 
 The conservative topology candidate is a static three-node cluster in one private
 datacenter; five nodes are an unqualified option, not a measured recommendation. Every
-node must be able to reach every configured peer. Keep node ports behind private-network
-firewall rules: the gRPC server listens on all interfaces, and direct gRPC access is not
-authenticated when mTLS is omitted. Do not expose this configuration to the public
-internet.
+node must be able to reach every configured peer. The gRPC listener defaults to loopback
+and requires mTLS plus RPC role tokens; use private bind addresses and firewall rules for
+remote peers. Plaintext is available only through the explicit loopback development mode.
+Do not expose demo configuration to the public internet.
 
 The code uses POSIX file APIs (`fsync`, directory `fsync`, and atomic rename) for durable
 state replacement. A candidate environment is Linux or macOS with a local filesystem
@@ -75,10 +75,10 @@ not authorize production use or change the remaining validation work in later ph
 - ✅ Drafted an initial, conservative deployment profile: static 3- or 5-node clusters, private single-datacenter network, and controlled internal-use scope. This profile is not yet measured, approved, or a production support guarantee.
 - ✅ Documented that reloading the peer file is not a safe Raft voting-membership change; static membership remains the only supported mode.
 - ✅ Gateway now defaults to loopback binding. Public binding requires explicit opt-in and a configured users file; regression tests cover these checks.
-- ✅ Dashboard account authentication, per-user key isolation, and password-file permissions are implemented and covered by gateway tests. This does not authenticate direct gRPC clients.
-- ✅ mTLS options are implemented for server/client/gateway configuration, but mTLS is optional and is not yet enforced as a deployment default.
-- ✅ Partial server TLS configuration is rejected rather than silently falling back to plaintext; bind failures now return a failing process exit code. This does not change the default insecure gRPC mode.
-- ✅ The gateway exposes health/readiness endpoints and Prometheus counters for gateway operations and HTTP method/status pairs. These do not provide Raft-node metrics, latency histograms, or resource measurements.
+- ✅ Dashboard account authentication, per-user key isolation, and password-file permissions are implemented and covered by gateway tests. Direct gRPC additionally requires mTLS and scoped tokens.
+- ✅ mTLS and role-token authorization are required for normal server/client/gateway operation; the local demo opts into loopback-only plaintext development mode explicitly.
+- ✅ Partial TLS/auth configuration is rejected rather than silently falling back to plaintext; bind failures return a failing process exit code.
+- ✅ The gateway exposes health/readiness endpoints, HTTP counters/latency histograms, and node Prometheus metrics cover Raft state, replication lag, WAL/snapshot activity, RPC latency/errors, process resource use, and storage file size.
 - ✅ The server enforces per-item input limits of 4 KiB per key, 1 MiB per value, and 256 bytes per request/client ID. These limits are not workload or capacity targets.
 
 ### Phase 1: Supported deployment profile — complete for the controlled-experimentation scope
@@ -107,22 +107,44 @@ independent consensus/persistence review.
 - ⬜ Verify acknowledged-write durability for the explicitly supported crash and power-loss model.
 - ⬜ Add long-running multi-node soak tests and obtain independent consensus/persistence review.
 
-### Phase 3: Security — incomplete
+### Phase 3: Security — complete for the controlled-experimentation implementation
 
-- ⬜ Authenticate and authorize direct gRPC clients; dashboard login does not protect direct gRPC access.
-- ⬜ Implement and verify least-privilege access for reads, writes, administration, backups, and restores.
-- ⬜ Require TLS/mTLS by default for supported deployments and define safe node bind/network defaults.
-- ⬜ Document and validate certificate/secret provisioning, rotation, revocation, expiry, and emergency replacement.
+The security boundary is implemented and regression-tested, but is not a production
+certification. Only trusted operators should issue credentials or expose network
+listeners. See the security setup and lifecycle procedure in
+[the security setup guide](SECURITY.md).
+
+- ✅ Authenticate every implemented direct gRPC operation with a bearer token; TLS/mTLS is required by default.
+- ✅ Apply separate `read`, `write`, `monitor`, and `node` roles. Node credentials cannot call key-value RPCs; peer forwarding preserves the caller's role. Dashboard backup/restore uses its gateway's explicit read/write identity and remains account-namespaced.
+- ✅ Require mTLS and RPC authorization for normal server, C++ client, and gateway startup; plaintext is an explicit loopback-only development mode.
+- ✅ Default node listeners to loopback; a non-loopback listener requires explicit configuration and TLS/mTLS.
+- ✅ Document private credential file permissions, provisioning, staged certificate rotation, token revocation, expiry handling, and emergency replacement.
 - ✅ Make gateway loopback binding the default; require explicit opt-in and configured dashboard authentication for non-loopback/public binding.
-- ⬜ Complete dependency/configuration/threat-model review and test abuse, resource exhaustion, authentication failures, and connection limits.
-- ⬜ Establish approval and handling procedures for production credentials and configuration.
+- ✅ Review declared dependency/configuration boundaries and document the threat model; configure a per-connection gRPC stream limit and a 16 MiB inbound message ceiling; test unauthenticated access, role violations, and oversize request rejection. No dependency lockfile or independent upstream security audit is present.
+- ✅ Document credential ownership, approval, storage, and replacement handling.
 
-### Phase 4: Operations and observability — incomplete
+The token authorization file is loaded at process startup; changing it requires a
+controlled restart of every node. The server does not implement certificate revocation
+Lists, automated rotation, per-key gRPC ACLs, or a separately privileged backup RPC.
+Direct read/write tokens address the global keyspace; dashboard account isolation is
+provided only by the authenticated gateway. These limitations, independent security
+review, and production credential approval remain deployment gates, not claims that
+the system is safe for production data.
 
-- ⬜ Add structured, configurable logs and production metrics for Raft state, replication lag, WAL/snapshot activity, request latency/errors, and resource use.
-- ⬜ Define alerts, health/readiness behavior, graceful shutdown, restart policy, and capacity guidance.
-- ⬜ Document backup retention, off-host storage, restore drills, disaster recovery, and migration procedures.
-- ⬜ Provide reproducible packaging/deployment, configuration examples, and an upgrade/rollback procedure.
+### Phase 4: Operations and observability — complete for the controlled-experimentation implementation
+
+The implementation and runbooks now provide operator hooks and candidate procedures; they
+do not establish production thresholds, capacity, recovery targets, or a supported release.
+
+- ✅ Emit JSON-line node/gateway logs with configurable severity, Raft transition and persistence events, and no key/value data in node apply logs.
+- ✅ Provide optional loopback-by-default Prometheus node metrics, gateway HTTP count/latency metrics, readiness/health definitions, SIGTERM graceful shutdown, and an external restart-policy example.
+- ✅ Document candidate alerts, capacity limitations, off-host backup/retention, restore drills, disaster recovery, migration, and rollback constraints.
+- ✅ Provide CMake install/TGZ packaging, a node config example, and repeatable deployment-build guidance. Credentials/data are intentionally excluded from packages.
+
+See the [operations runbook](OPERATIONS.md) for scraping and alerting, backup/restore
+limitations, deployment controls, migration and restart procedures. Production thresholds,
+backup retention approval, restore qualification, and signed release artifacts remain
+operator/release gates.
 
 ### Phase 5: Performance and release validation — not started
 

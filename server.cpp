@@ -1,6 +1,8 @@
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <memory>
 #include <vector>
@@ -8,6 +10,8 @@
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
+#include <csignal>
+#include <cstdlib>
 #include <random>
 #include <algorithm>
 #include <cerrno>
@@ -20,10 +24,20 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <initializer_list>
+#include <utility>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <openssl/sha.h>
+#include <poll.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/grpcpp.h>
 #include "kvstore.grpc.pb.h"
 #include "runtime_config.h"
@@ -52,11 +66,89 @@ using kvstore::SetResponse;
 using kvstore::VoteRequest;
 using kvstore::VoteResponse;
 
+namespace {
+
+std::mutex log_mutex;
+std::atomic<int> configured_log_level{1};
+volatile std::sig_atomic_t termination_signal = 0;
+volatile std::sig_atomic_t shutdown_wakeup_fd = -1;
+
+std::string JsonEscape(const std::string &value)
+{
+    std::ostringstream escaped;
+    for (const unsigned char character : value)
+    {
+        switch (character)
+        {
+        case '"': escaped << "\\\""; break;
+        case '\\': escaped << "\\\\"; break;
+        case '\n': escaped << "\\n"; break;
+        case '\r': escaped << "\\r"; break;
+        case '\t': escaped << "\\t"; break;
+        default:
+            if (character < 0x20)
+                escaped << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(character) << std::dec;
+            else
+                escaped << static_cast<char>(character);
+        }
+    }
+    return escaped.str();
+}
+
+void ConfigureLogLevel()
+{
+    const char *level = std::getenv("KV_LOG_LEVEL");
+    const std::string configured = level ? level : "info";
+    if (configured == "debug")
+        configured_log_level = 0;
+    else if (configured == "info")
+        configured_log_level = 1;
+    else if (configured == "warn")
+        configured_log_level = 2;
+    else if (configured == "error")
+        configured_log_level = 3;
+    else
+        throw std::runtime_error("KV_LOG_LEVEL must be debug, info, warn, or error");
+}
+
+void LogEvent(const std::string &level, int level_priority, const std::string &event,
+              std::initializer_list<std::pair<std::string, std::string>> fields = {})
+{
+    if (level_priority < configured_log_level.load())
+        return;
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cout << "{\"timestamp_unix_ms\":" << now_ms
+              << ",\"level\":\"" << level << "\",\"event\":\""
+              << JsonEscape(event) << '"';
+    for (const auto &[name, value] : fields)
+        std::cout << ",\"" << JsonEscape(name) << "\":\"" << JsonEscape(value) << '"';
+    std::cout << "}" << std::endl;
+}
+
+void HandleTerminationSignal(int signal_number)
+{
+    termination_signal = signal_number;
+    const int wakeup_fd = static_cast<int>(shutdown_wakeup_fd);
+    if (wakeup_fd >= 0)
+    {
+        const char wakeup = 1;
+        const auto ignored = write(wakeup_fd, &wakeup, sizeof(wakeup));
+        (void)ignored;
+    }
+}
+
+} // namespace
+
 struct TlsConfig
 {
     std::string ca_file;
     std::string certificate_file;
     std::string private_key_file;
+    std::string auth_file;
+    std::string token_file;
 
     bool Enabled() const
     {
@@ -68,6 +160,91 @@ struct TlsConfig
         return !ca_file.empty() || !certificate_file.empty() || !private_key_file.empty();
     }
 };
+
+using TokenRoles = std::unordered_map<std::string, std::unordered_set<std::string>>;
+
+static bool IsPrivateFile(const std::filesystem::path &path)
+{
+    if (std::filesystem::status(path).permissions() == std::filesystem::perms::unknown)
+        return false;
+    const auto permissions = std::filesystem::status(path).permissions();
+    return (permissions & (std::filesystem::perms::group_all |
+                           std::filesystem::perms::others_all)) == std::filesystem::perms::none;
+}
+
+static std::string Sha256Hex(const std::string &value)
+{
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char *>(value.data()), value.size(), digest);
+    std::ostringstream result;
+    for (const auto byte : digest)
+        result << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    return result.str();
+}
+
+static TokenRoles LoadTokenRoles(const std::filesystem::path &path)
+{
+    if (!IsPrivateFile(path))
+        throw std::runtime_error("authorization file must have mode 0600 or stricter: " + path.string());
+    std::ifstream input(path);
+    if (!input)
+        throw std::runtime_error("failed to open authorization file: " + path.string());
+
+    const std::unordered_set<std::string> valid_roles = {"read", "write", "monitor", "node"};
+    TokenRoles roles_by_hash;
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(input, line))
+    {
+        ++line_number;
+        const auto first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || line[first] == '#')
+            continue;
+        const auto separator = line.find('=');
+        if (separator == std::string::npos)
+            throw std::runtime_error("invalid authorization file at line " + std::to_string(line_number));
+        const auto hash = line.substr(0, separator);
+        if (hash.size() != SHA256_DIGEST_LENGTH * 2 ||
+            hash.find_first_not_of("0123456789abcdef") != std::string::npos)
+            throw std::runtime_error("authorization token hash must be lowercase SHA-256 hex at line " +
+                                     std::to_string(line_number));
+        std::unordered_set<std::string> roles;
+        std::istringstream role_stream(line.substr(separator + 1));
+        std::string role;
+        while (std::getline(role_stream, role, ','))
+        {
+            const auto role_start = role.find_first_not_of(" \t\r\n");
+            const auto role_end = role.find_last_not_of(" \t\r\n");
+            if (role_start == std::string::npos)
+                continue;
+            role = role.substr(role_start, role_end - role_start + 1);
+            if (!valid_roles.count(role))
+                throw std::runtime_error("unknown authorization role at line " + std::to_string(line_number));
+            roles.insert(role);
+        }
+        if (roles.empty() || !roles_by_hash.emplace(hash, std::move(roles)).second)
+            throw std::runtime_error("empty or duplicate authorization entry at line " +
+                                     std::to_string(line_number));
+    }
+    if (roles_by_hash.empty())
+        throw std::runtime_error("authorization file must define at least one token");
+    return roles_by_hash;
+}
+
+static std::string ReadSecretFile(const std::filesystem::path &path)
+{
+    if (!IsPrivateFile(path))
+        throw std::runtime_error("token file must have mode 0600 or stricter: " + path.string());
+    std::ifstream input(path);
+    if (!input)
+        throw std::runtime_error("failed to open token file: " + path.string());
+    std::string token{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    while (!token.empty() && (token.back() == '\n' || token.back() == '\r'))
+        token.pop_back();
+    if (token.size() < 32)
+        throw std::runtime_error("token file must contain at least 32 bytes");
+    return token;
+}
 
 static std::string ReadTextFile(const std::string &path)
 {
@@ -96,7 +273,7 @@ private:
     static constexpr std::size_t kMaxRequestIdBytes = 256;
     // Applied state machine - only reflects committed log entries.
     std::unordered_map<std::string, std::string> store;
-    std::mutex store_mutex;
+    mutable std::mutex store_mutex;
 
     struct WriteRequestResult {
         bool success = false;
@@ -191,6 +368,7 @@ private:
             ClusterStatusResponse status_resp;
             ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(1));
+            AddNodeAuth(ctx);
             const auto status = peer_stubs[i]->GetClusterStatus(&ctx, status_req, &status_resp);
             if (status.ok() && status_resp.is_leader())
                 return peer_stubs[i];
@@ -263,7 +441,8 @@ private:
             match_index.assign(peer_stubs.size(), snapshot_last_index);
         }
         peers_file_timestamp = timestamp;
-        std::cout << "Reloaded " << peer_stubs.size() << " peers from " << peers_file << std::endl;
+        LogEvent("info", 1, "peer_endpoints_reloaded",
+                 {{"count", std::to_string(peer_stubs.size())}, {"source", peers_file.string()}});
     }
 
     // Core Raft state.
@@ -273,7 +452,7 @@ private:
     int voted_for = -1;
     int known_leader_id = -1;
     int node_id;
-    std::mutex election_mutex;
+    mutable std::mutex election_mutex;
 
     // Tracks the last time we heard from a leader (used for election timeouts).
     std::chrono::steady_clock::time_point last_heartbeat;
@@ -292,13 +471,112 @@ private:
     bool snapshot_has_versioned_format = false;
     int commit_index = -1; // highest log index known to be committed
     int last_applied = -1; // highest log index applied to the state machine
-    std::mutex log_mutex;
+    mutable std::mutex log_mutex;
     std::mutex replication_mutex;
     std::vector<int> next_index;  // leader-only: next log index to send to each peer
     std::vector<int> match_index; // leader-only: highest log index known to be replicated on each peer
     std::filesystem::path data_directory;
     std::ofstream wal;
     TlsConfig tls_config;
+    TokenRoles token_roles;
+    std::string node_token;
+    struct RpcMetric
+    {
+        std::uint64_t requests = 0;
+        std::uint64_t errors = 0;
+        std::uint64_t duration_microseconds = 0;
+    };
+    mutable std::mutex metrics_mutex;
+    mutable std::unordered_map<std::string, RpcMetric> rpc_metrics;
+    std::atomic<std::uint64_t> wal_records_written{0};
+    std::atomic<std::uint64_t> wal_bytes_written{0};
+    std::atomic<std::uint64_t> snapshots_written{0};
+    std::atomic<std::uint64_t> snapshot_bytes_written{0};
+
+    void RecordRpc(const std::string &method, std::uint64_t duration_microseconds)
+    {
+        std::lock_guard<std::mutex> lock(metrics_mutex);
+        auto &metric = rpc_metrics[method];
+        ++metric.requests;
+        metric.duration_microseconds += duration_microseconds;
+    }
+
+    void RecordRpcError(const std::string &method) const
+    {
+        std::lock_guard<std::mutex> lock(metrics_mutex);
+        ++rpc_metrics[method].errors;
+    }
+
+    Status RpcError(const std::string &method, grpc::StatusCode code,
+                    const std::string &message) const
+    {
+        RecordRpcError(method);
+        return Status(code, message);
+    }
+
+    class RpcMetricTimer
+    {
+    public:
+        RpcMetricTimer(KVStoreServiceImpl &owner, std::string method)
+            : owner_(owner), method_(std::move(method)), started_(std::chrono::steady_clock::now())
+        {
+        }
+
+        ~RpcMetricTimer()
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started_).count();
+            owner_.RecordRpc(method_, static_cast<std::uint64_t>(std::max<std::int64_t>(0, elapsed)));
+        }
+
+    private:
+        KVStoreServiceImpl &owner_;
+        std::string method_;
+        std::chrono::steady_clock::time_point started_;
+    };
+
+    void AddNodeAuth(ClientContext &context) const
+    {
+        if (!node_token.empty())
+            context.AddMetadata("authorization", "Bearer " + node_token);
+    }
+
+    static void AddForwardedAuth(const ServerContext *incoming, ClientContext &outgoing)
+    {
+        const auto token = incoming->client_metadata().find("authorization");
+        if (token != incoming->client_metadata().end())
+            outgoing.AddMetadata("authorization", std::string(token->second.data(), token->second.size()));
+    }
+
+    Status Authorize(const ServerContext *context, const std::string &required_role) const
+    {
+        if (tls_config.auth_file.empty())
+            return Status::OK;
+        std::string method = context->method();
+        const auto method_separator = method.rfind('/');
+        if (method_separator != std::string::npos)
+            method.erase(0, method_separator + 1);
+        auto reject = [this, &method](grpc::StatusCode code, const char *message) {
+            RecordRpcError(method);
+            return Status(code, message);
+        };
+        const auto token_metadata = context->client_metadata().equal_range("authorization");
+        if (token_metadata.first == token_metadata.second)
+            return reject(grpc::StatusCode::UNAUTHENTICATED, "authorization token is required");
+
+        if (std::next(token_metadata.first) != token_metadata.second)
+            return reject(grpc::StatusCode::UNAUTHENTICATED, "multiple authorization tokens are not allowed");
+        const std::string value(token_metadata.first->second.data(), token_metadata.first->second.size());
+        constexpr const char *prefix = "Bearer ";
+        if (value.compare(0, 7, prefix) != 0 || value.size() <= 7)
+            return reject(grpc::StatusCode::UNAUTHENTICATED, "invalid authorization token");
+        const auto identity = token_roles.find(Sha256Hex(value.substr(7)));
+        if (identity == token_roles.end())
+            return reject(grpc::StatusCode::UNAUTHENTICATED, "invalid authorization token");
+        if (!identity->second.count(required_role))
+            return reject(grpc::StatusCode::PERMISSION_DENIED, "authorization role is insufficient");
+        return Status::OK;
+    }
 
     static std::uint32_t ComputeCrc32(const std::string &payload)
     {
@@ -504,6 +782,8 @@ private:
             throw std::runtime_error("failed to serialize WAL record");
         wal.clear();
         WriteRecord(wal, data_directory / "raft.wal", serialized);
+        wal_records_written.fetch_add(1);
+        wal_bytes_written.fetch_add(serialized.size() + sizeof(std::uint32_t) * 2);
     }
 
     void RewriteWal()
@@ -514,6 +794,8 @@ private:
         wal.clear();
         try
         {
+            std::uint64_t rewritten_records = 0;
+            std::uint64_t rewritten_bytes = 0;
             {
                 std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
                 if (!output)
@@ -530,6 +812,8 @@ private:
                     output.write(reinterpret_cast<const char *>(&size), sizeof(size));
                     output.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
                     output.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+                    ++rewritten_records;
+                    rewritten_bytes += serialized.size() + sizeof(size) + sizeof(checksum);
                 }
                 output.flush();
                 if (!output)
@@ -541,6 +825,8 @@ private:
             wal = std::ofstream(wal_path, std::ios::binary | std::ios::app);
             if (!wal)
                 throw std::runtime_error("failed to reopen WAL");
+            wal_records_written.fetch_add(rewritten_records);
+            wal_bytes_written.fetch_add(rewritten_bytes);
         }
         catch (...)
         {
@@ -588,7 +874,7 @@ private:
             catch (const std::runtime_error &error)
             {
                 truncated_tail = true;
-                std::cerr << "Ignoring trailing corrupt WAL entry: " << error.what() << std::endl;
+                LogEvent("warn", 2, "wal_trailing_record_ignored", {{"error", error.what()}});
                 break;
             }
 
@@ -596,7 +882,7 @@ private:
             if (!entry.ParseFromString(record))
             {
                 truncated_tail = true;
-                std::cerr << "Ignoring trailing invalid WAL entry" << std::endl;
+                LogEvent("warn", 2, "wal_trailing_record_invalid");
                 break;
             }
             if (entry.log_index_plus_one() != 0)
@@ -636,7 +922,7 @@ private:
         if (truncated_tail)
         {
             input.close();
-            std::cerr << "Truncating corrupt WAL tail and rewriting valid log prefix" << std::endl;
+            LogEvent("warn", 2, "wal_corrupt_tail_truncated");
             RewriteWal();
         }
         else
@@ -645,8 +931,8 @@ private:
             if (!wal)
                 throw std::runtime_error("failed to open WAL: " + wal_path.string());
         }
-        std::cout << "Recovered " << log_entries.size() << " log entries from "
-                  << wal_path << std::endl;
+        LogEvent("info", 1, "raft_wal_recovered",
+                 {{"entries", std::to_string(log_entries.size())}, {"path", wal_path.string()}});
     }
 
     void PersistMetadata()
@@ -774,6 +1060,8 @@ private:
         }
         std::filesystem::rename(temporary, snapshot_path);
         SyncDirectoryPath(data_directory);
+        snapshots_written.fetch_add(1);
+        snapshot_bytes_written.fetch_add(payload.size());
     }
 
     void CompactSnapshot()
@@ -804,7 +1092,8 @@ private:
         }
         catch (const std::exception &error)
         {
-            std::cerr << "Snapshot persistence failed; retaining WAL: " << error.what() << std::endl;
+            LogEvent("error", 3, "snapshot_persist_failed",
+                     {{"error", error.what()}, {"action", "retaining_wal"}});
             return;
         }
 
@@ -818,10 +1107,10 @@ private:
         }
         catch (const std::exception &error)
         {
-            std::cerr << "WAL compaction failed; durable snapshot remains usable: "
-                      << error.what() << std::endl;
+            LogEvent("error", 3, "wal_compaction_failed",
+                     {{"error", error.what()}, {"snapshot_remains_usable", "true"}});
         }
-        std::cout << "Compacted Raft log through index " << target << std::endl;
+        LogEvent("info", 1, "raft_log_compacted", {{"last_index", std::to_string(target)}});
     }
 
     // Generates a randomized election timeout to reduce the chance of
@@ -850,7 +1139,8 @@ private:
                 store.erase(e.key());
             else
                 store[e.key()] = e.value();
-            std::cout << "APPLIED index=" << last_applied << " " << e.key() << std::endl;
+            LogEvent("debug", 0, "raft_entry_applied",
+                     {{"index", std::to_string(last_applied)}, {"node_id", std::to_string(node_id)}});
         }
     }
 
@@ -877,6 +1167,7 @@ private:
         kvstore::InstallSnapshotResponse resp;
         ClientContext ctx;
         ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        AddNodeAuth(ctx);
         const auto status = peers[peer_idx]->InstallSnapshot(&ctx, req, &resp);
         if (!status.ok())
             return false;
@@ -929,6 +1220,7 @@ private:
             AppendEntriesResponse resp;
             ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+            AddNodeAuth(ctx);
             Status status = peers[peer_idx]->AppendEntries(&ctx, req, &resp);
 
             if (!status.ok())
@@ -1006,6 +1298,7 @@ private:
             VoteResponse response;
             ClientContext context;
             context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+            AddNodeAuth(context);
             const auto status = stub->RequestVote(&context, request, &response);
             if (status.ok() && response.voter_term() > observed_term)
             {
@@ -1025,8 +1318,8 @@ private:
 
         if (pre_votes < majority)
         {
-            std::cout << "Pre-vote failed (" << pre_votes << "/" << total_nodes
-                      << ") - remaining FOLLOWER" << std::endl;
+            LogEvent("debug", 0, "raft_pre_vote_failed",
+                     {{"votes", std::to_string(pre_votes)}, {"cluster_size", std::to_string(total_nodes)}});
             return;
         }
 
@@ -1040,7 +1333,8 @@ private:
             PersistMetadata();
             state = NodeState::CANDIDATE;
             my_term = current_term;
-            std::cout << "Becoming CANDIDATE for term " << current_term << std::endl;
+            LogEvent("info", 1, "raft_candidate_started",
+                     {{"term", std::to_string(current_term)}, {"node_id", std::to_string(node_id)}});
         }
 
         int votes = 1; // vote for self
@@ -1054,6 +1348,7 @@ private:
             VoteResponse resp;
             ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(1000));
+            AddNodeAuth(ctx);
             Status status = stub->RequestVote(&ctx, req, &resp);
             if (status.ok() && resp.voter_term() > my_term)
             {
@@ -1082,16 +1377,17 @@ private:
                 state = NodeState::LEADER;
                 leader_ready = false;
                 known_leader_id = node_id;
-                std::cout << "*** BECAME LEADER for term " << current_term
-                          << " with " << votes << "/" << total_nodes << " votes ***" << std::endl;
+                LogEvent("info", 1, "raft_leader_elected",
+                         {{"term", std::to_string(current_term)}, {"node_id", std::to_string(node_id)},
+                          {"votes", std::to_string(votes)}, {"cluster_size", std::to_string(total_nodes)}});
                 won_election = true;
             }
             else
             {
                 state = NodeState::FOLLOWER;
                 leader_ready = false;
-                std::cout << "Election failed (" << votes << "/" << total_nodes
-                          << " votes) - reverting to FOLLOWER" << std::endl;
+                LogEvent("info", 1, "raft_election_failed",
+                         {{"votes", std::to_string(votes)}, {"cluster_size", std::to_string(total_nodes)}});
             }
         }
 
@@ -1151,7 +1447,7 @@ private:
                 catch (const std::exception &error)
                 {
                     log_entries.pop_back();
-                    std::cerr << "Failed to persist Raft log entry: " << error.what() << std::endl;
+                    LogEvent("error", 3, "raft_wal_append_failed", {{"error", error.what()}});
                     return false;
                 }
                 new_index = log_offset + static_cast<int>(log_entries.size()) - 1;
@@ -1194,8 +1490,8 @@ private:
         for (size_t i = 0; i < peers.size(); i++)
             SendAppendEntries(i);
         if (!committed)
-            std::cerr << "Write on leader " << node_id
-                      << " was not committed by a current-term quorum" << std::endl;
+            LogEvent("warn", 2, "raft_write_not_committed",
+                     {{"node_id", std::to_string(node_id)}});
         return committed;
     }
 
@@ -1217,6 +1513,7 @@ private:
             HeartbeatResponse response;
             ClientContext context;
             context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(1));
+            AddNodeAuth(context);
             const auto status = stub->Heartbeat(&context, request, &response);
             if (status.ok() && response.alive() && response.term() == observed_term)
                 active_nodes++;
@@ -1253,6 +1550,149 @@ private:
     }
 
 public:
+    std::string RenderMetrics() const
+    {
+        std::ostringstream metrics;
+        const auto current_state = state.load();
+        int term;
+        int leader_id;
+        {
+            std::lock_guard<std::mutex> lock(election_mutex);
+            term = current_term;
+            leader_id = current_state == NodeState::LEADER ? node_id : known_leader_id;
+        }
+
+        int committed;
+        int snapshot_index;
+        int log_size;
+        std::vector<int> peer_lag;
+        {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            committed = commit_index;
+            snapshot_index = snapshot_last_index;
+            log_size = static_cast<int>(log_entries.size());
+            for (const int peer_match : match_index)
+                peer_lag.push_back(std::max(0, commit_index - peer_match));
+        }
+
+        std::size_t key_count;
+        {
+            std::lock_guard<std::mutex> lock(store_mutex);
+            key_count = store.size();
+        }
+
+        const char *state_name = current_state == NodeState::LEADER ? "leader" :
+                                 current_state == NodeState::CANDIDATE ? "candidate" : "follower";
+        metrics << "# HELP raft_node_state Current Raft node role as a one-hot gauge.\n"
+                << "# TYPE raft_node_state gauge\n";
+        for (const char *candidate : {"leader", "candidate", "follower"})
+            metrics << "raft_node_state{node_id=\"" << node_id << "\",state=\"" << candidate
+                    << "\"} " << (state_name == std::string(candidate) ? 1 : 0) << '\n';
+        metrics << "# HELP raft_current_term Current Raft term.\n"
+                << "# TYPE raft_current_term gauge\n"
+                << "raft_current_term{node_id=\"" << node_id << "\"} " << term << '\n'
+                << "# HELP raft_leader_id Known leader ID, or -1 if unknown.\n"
+                << "# TYPE raft_leader_id gauge\n"
+                << "raft_leader_id{node_id=\"" << node_id << "\"} " << leader_id << '\n'
+                << "# HELP raft_commit_index Highest committed log index.\n"
+                << "# TYPE raft_commit_index gauge\n"
+                << "raft_commit_index{node_id=\"" << node_id << "\"} " << committed << '\n'
+                << "# HELP raft_snapshot_index Last included snapshot index.\n"
+                << "# TYPE raft_snapshot_index gauge\n"
+                << "raft_snapshot_index{node_id=\"" << node_id << "\"} " << snapshot_index << '\n'
+                << "# HELP raft_log_entries Current in-memory log entries.\n"
+                << "# TYPE raft_log_entries gauge\n"
+                << "raft_log_entries{node_id=\"" << node_id << "\"} " << log_size << '\n'
+                << "# HELP raft_replication_lag_entries Commit-index lag for each peer slot.\n"
+                << "# TYPE raft_replication_lag_entries gauge\n";
+        for (std::size_t index = 0; index < peer_lag.size(); ++index)
+            metrics << "raft_replication_lag_entries{node_id=\"" << node_id
+                    << "\",peer_index=\"" << index << "\"} " << peer_lag[index] << '\n';
+        metrics << "# HELP raft_store_keys Current number of stored keys.\n"
+                << "# TYPE raft_store_keys gauge\n"
+                << "raft_store_keys{node_id=\"" << node_id << "\"} " << key_count << '\n'
+                << "# HELP raft_wal_records_written_total WAL records appended or rewritten.\n"
+                << "# TYPE raft_wal_records_written_total counter\n"
+                << "raft_wal_records_written_total{node_id=\"" << node_id << "\"} "
+                << wal_records_written.load() << '\n'
+                << "# HELP raft_wal_bytes_written_total WAL payload and framing bytes written.\n"
+                << "# TYPE raft_wal_bytes_written_total counter\n"
+                << "raft_wal_bytes_written_total{node_id=\"" << node_id << "\"} "
+                << wal_bytes_written.load() << '\n'
+                << "# HELP raft_snapshots_written_total Snapshot files successfully persisted.\n"
+                << "# TYPE raft_snapshots_written_total counter\n"
+                << "raft_snapshots_written_total{node_id=\"" << node_id << "\"} "
+                << snapshots_written.load() << '\n'
+                << "# HELP raft_snapshot_bytes_written_total Snapshot payload bytes persisted.\n"
+                << "# TYPE raft_snapshot_bytes_written_total counter\n"
+                << "raft_snapshot_bytes_written_total{node_id=\"" << node_id << "\"} "
+                << snapshot_bytes_written.load() << '\n';
+
+        std::vector<std::pair<std::string, RpcMetric>> rpc_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(metrics_mutex);
+            rpc_snapshot.reserve(rpc_metrics.size());
+            for (const auto &entry : rpc_metrics)
+                rpc_snapshot.push_back(entry);
+        }
+        metrics << "# HELP kvstore_rpc_requests_total RPC calls handled by method.\n"
+                << "# TYPE kvstore_rpc_requests_total counter\n";
+        for (const auto &[method, metric] : rpc_snapshot)
+            metrics << "kvstore_rpc_requests_total{node_id=\"" << node_id
+                    << "\",method=\"" << JsonEscape(method) << "\"} " << metric.requests << '\n';
+        metrics << "# HELP kvstore_rpc_errors_total RPC calls returning a non-OK gRPC status.\n"
+                << "# TYPE kvstore_rpc_errors_total counter\n";
+        for (const auto &[method, metric] : rpc_snapshot)
+            metrics << "kvstore_rpc_errors_total{node_id=\"" << node_id
+                    << "\",method=\"" << JsonEscape(method) << "\"} " << metric.errors << '\n';
+        metrics << "# HELP kvstore_rpc_duration_seconds_sum Total RPC handler duration.\n"
+                << "# TYPE kvstore_rpc_duration_seconds_sum counter\n";
+        for (const auto &[method, metric] : rpc_snapshot)
+            metrics << "kvstore_rpc_duration_seconds_sum{node_id=\"" << node_id
+                    << "\",method=\"" << JsonEscape(method) << "\"} "
+                    << static_cast<double>(metric.duration_microseconds) / 1'000'000.0 << '\n';
+        metrics << "# HELP kvstore_rpc_duration_seconds_count Number of timed RPC handlers.\n"
+                << "# TYPE kvstore_rpc_duration_seconds_count counter\n";
+        for (const auto &[method, metric] : rpc_snapshot)
+            metrics << "kvstore_rpc_duration_seconds_count{node_id=\"" << node_id
+                    << "\",method=\"" << JsonEscape(method) << "\"} " << metric.requests << '\n';
+
+        std::uintmax_t storage_bytes = 0;
+        std::error_code file_error;
+        for (const char *name : {"raft.meta", "raft.wal", "raft.snapshot"})
+        {
+            const auto file_size = std::filesystem::file_size(data_directory / name, file_error);
+            if (!file_error)
+                storage_bytes += file_size;
+            file_error.clear();
+        }
+        metrics << "# HELP raft_storage_bytes Current size of Raft metadata, WAL, and snapshot files.\n"
+                << "# TYPE raft_storage_bytes gauge\n"
+                << "raft_storage_bytes{node_id=\"" << node_id << "\"} " << storage_bytes << '\n';
+
+        struct rusage usage {};
+        if (getrusage(RUSAGE_SELF, &usage) == 0)
+        {
+            const auto cpu_microseconds =
+                usage.ru_utime.tv_sec * 1'000'000LL + usage.ru_utime.tv_usec +
+                usage.ru_stime.tv_sec * 1'000'000LL + usage.ru_stime.tv_usec;
+#ifdef __APPLE__
+            const auto resident_bytes = usage.ru_maxrss;
+#else
+            const auto resident_bytes = usage.ru_maxrss * 1024LL;
+#endif
+            metrics << "# HELP process_cpu_seconds_total User and system CPU time.\n"
+                    << "# TYPE process_cpu_seconds_total counter\n"
+                    << "process_cpu_seconds_total{node_id=\"" << node_id << "\"} "
+                    << static_cast<double>(cpu_microseconds) / 1'000'000.0 << '\n'
+                    << "# HELP process_max_resident_memory_bytes Maximum resident set size.\n"
+                    << "# TYPE process_max_resident_memory_bytes gauge\n"
+                    << "process_max_resident_memory_bytes{node_id=\"" << node_id << "\"} "
+                    << resident_bytes << '\n';
+        }
+        return metrics.str();
+    }
+
     KVStoreServiceImpl(int my_port, const std::vector<std::string> &peer_addresses,
                        const std::vector<int> &peer_port_ids,
                        const std::filesystem::path &storage_path,
@@ -1262,6 +1702,11 @@ public:
         node_id = my_port;
         data_directory = storage_path;
         tls_config = security_config;
+        if (!tls_config.auth_file.empty())
+        {
+            token_roles = LoadTokenRoles(tls_config.auth_file);
+            node_token = ReadSecretFile(tls_config.token_file);
+        }
         peers_file = membership_path;
         last_heartbeat = std::chrono::steady_clock::now();
         LoadPersistentState();
@@ -1295,7 +1740,7 @@ public:
                     {
             while (running) {
                 try { ReloadPeersIfChanged(); } catch (const std::exception& error) {
-                    std::cerr << "Membership reload failed: " << error.what() << std::endl;
+                    LogEvent("error", 3, "peer_endpoint_reload_failed", {{"error", error.what()}});
                 }
                 int timeout_ms = RandomElectionTimeout();
                 {
@@ -1335,6 +1780,7 @@ public:
                         HeartbeatResponse resp;
                         ClientContext ctx;
                         ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+                        AddNodeAuth(ctx);
                         const auto status = stub->Heartbeat(&ctx, req, &resp);
                         if (status.ok() && resp.alive() && resp.term() == observed_term) {
                             reachable++;
@@ -1360,8 +1806,9 @@ public:
                             leader_ready = false;
                             std::lock_guard<std::mutex> hb_lock(heartbeat_mutex);
                             last_heartbeat = std::chrono::steady_clock::now();
-                            std::cout << "Leader lost quorum at term " << current_term
-                                      << " - stepping down" << std::endl;
+                            LogEvent("warn", 2, "raft_leader_lost_quorum",
+                                     {{"term", std::to_string(current_term)},
+                                      {"node_id", std::to_string(node_id)}});
                         }
                     }
                 }
@@ -1385,8 +1832,13 @@ public:
     // Follower-side handler: receives log entries (or heartbeats) from the leader.
     Status AppendEntries(ServerContext *context, const AppendEntriesRequest *request, AppendEntriesResponse *response) override
     {
+        RpcMetricTimer metric(*this, "AppendEntries");
+        const auto authorization = Authorize(context, "node");
+        if (!authorization.ok())
+            return authorization;
         if (request->leader_id() != node_id && !IsConfiguredPeer(request->leader_id()))
-            return Status(grpc::StatusCode::PERMISSION_DENIED, "AppendEntries sender is not a configured peer");
+            return RpcError("AppendEntries", grpc::StatusCode::PERMISSION_DENIED,
+                            "AppendEntries sender is not a configured peer");
         {
             std::lock_guard<std::mutex> lock(election_mutex);
             if (request->leader_term() < current_term)
@@ -1397,24 +1849,28 @@ public:
                 return Status::OK;
             }
             if (request->entries_size() > 1024)
-                return Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "AppendEntries batch exceeds 1024 entries");
+                return RpcError("AppendEntries", grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                "AppendEntries batch exceeds 1024 entries");
             for (const auto &entry : request->entries())
             {
                 if (entry.key().size() > kMaxKeyBytes || entry.value().size() > kMaxValueBytes ||
                     entry.request_id().size() > kMaxRequestIdBytes)
-                    return Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "replicated entry exceeds configured size limits");
+                    return RpcError("AppendEntries", grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                    "replicated entry exceeds configured size limits");
                 if (entry.term() < 0 || entry.term() > request->leader_term())
-                    return Status(grpc::StatusCode::INVALID_ARGUMENT,
-                                  "AppendEntries entry term is outside the leader term");
+                    return RpcError("AppendEntries", grpc::StatusCode::INVALID_ARGUMENT,
+                                    "AppendEntries entry term is outside the leader term");
             }
             if (request->leader_term() < 0 || request->prev_log_index() < -1 ||
                 request->prev_log_index() == std::numeric_limits<int>::max() ||
                 request->prev_log_term() < 0 || request->leader_commit() < -1)
-                return Status(grpc::StatusCode::INVALID_ARGUMENT, "AppendEntries contains a negative Raft index");
+                return RpcError("AppendEntries", grpc::StatusCode::INVALID_ARGUMENT,
+                                "AppendEntries contains a negative Raft index");
             if (request->prev_log_index() >= 0 &&
                 request->entries_size() >
                     std::numeric_limits<int>::max() - request->prev_log_index())
-                return Status(grpc::StatusCode::INVALID_ARGUMENT, "AppendEntries index range overflows");
+                return RpcError("AppendEntries", grpc::StatusCode::INVALID_ARGUMENT,
+                                "AppendEntries index range overflows");
             if (request->leader_term() > current_term)
             {
                 current_term = request->leader_term();
@@ -1425,7 +1881,7 @@ public:
                 }
                 catch (const std::exception &error)
                 {
-                    return Status(grpc::StatusCode::INTERNAL, error.what());
+                    return RpcError("AppendEntries", grpc::StatusCode::INTERNAL, error.what());
                 }
             }
             state = NodeState::FOLLOWER;
@@ -1513,13 +1969,19 @@ public:
 
     Status InstallSnapshot(ServerContext *context, const kvstore::InstallSnapshotRequest *request, kvstore::InstallSnapshotResponse *response) override
     {
+        RpcMetricTimer metric(*this, "InstallSnapshot");
+        const auto authorization = Authorize(context, "node");
+        if (!authorization.ok())
+            return authorization;
         if (request->leader_id() != node_id && !IsConfiguredPeer(request->leader_id()))
-            return Status(grpc::StatusCode::PERMISSION_DENIED, "snapshot sender is not a configured peer");
+            return RpcError("InstallSnapshot", grpc::StatusCode::PERMISSION_DENIED,
+                            "snapshot sender is not a configured peer");
         if (request->leader_term() < 0 || request->last_included_index() < 0 ||
             request->last_included_index() == std::numeric_limits<int>::max() ||
             request->last_included_term() < 0 ||
             request->last_included_term() > request->leader_term())
-            return Status(grpc::StatusCode::INVALID_ARGUMENT, "snapshot contains invalid Raft metadata");
+            return RpcError("InstallSnapshot", grpc::StatusCode::INVALID_ARGUMENT,
+                            "snapshot contains invalid Raft metadata");
 
         SnapshotState snapshot;
         try
@@ -1528,7 +1990,7 @@ public:
         }
         catch (const std::exception &error)
         {
-            return Status(grpc::StatusCode::INVALID_ARGUMENT, error.what());
+            return RpcError("InstallSnapshot", grpc::StatusCode::INVALID_ARGUMENT, error.what());
         }
 
         {
@@ -1550,7 +2012,7 @@ public:
                 }
                 catch (const std::exception &error)
                 {
-                    return Status(grpc::StatusCode::INTERNAL, error.what());
+                    return RpcError("InstallSnapshot", grpc::StatusCode::INTERNAL, error.what());
                 }
             }
             state = NodeState::FOLLOWER;
@@ -1581,7 +2043,7 @@ public:
             }
             catch (const std::exception &error)
             {
-                return Status(grpc::StatusCode::INTERNAL, error.what());
+                return RpcError("InstallSnapshot", grpc::StatusCode::INTERNAL, error.what());
             }
             if (suffix_matches)
                 log_entries.erase(log_entries.begin(), log_entries.begin() + included_offset + 1);
@@ -1609,7 +2071,7 @@ public:
         }
         catch (const std::exception &error)
         {
-            return Status(grpc::StatusCode::INTERNAL, error.what());
+            return RpcError("InstallSnapshot", grpc::StatusCode::INTERNAL, error.what());
         }
 
         response->set_term(current_term);
@@ -1621,6 +2083,10 @@ public:
     // Handles a vote request from a candidate.
     Status RequestVote(ServerContext *context, const VoteRequest *request, VoteResponse *response) override
     {
+        RpcMetricTimer metric(*this, "RequestVote");
+        const auto authorization = Authorize(context, "node");
+        if (!authorization.ok())
+            return authorization;
         if (request->candidate_id() != node_id && !IsConfiguredPeer(request->candidate_id()))
         {
             response->set_vote_granted(false);
@@ -1681,16 +2147,22 @@ public:
         }
         response->set_vote_granted(grant);
         response->set_voter_term(current_term);
-        std::cout << "Vote request from node " << request->candidate_id()
-                  << " (term " << request->candidate_term() << ") -> "
-                  << (grant ? "GRANTED" : "DENIED") << std::endl;
+        LogEvent("debug", 0, "raft_vote_request",
+                 {{"candidate_id", std::to_string(request->candidate_id())},
+                  {"term", std::to_string(request->candidate_term())},
+                  {"granted", grant ? "true" : "false"}});
         return Status::OK;
     }
 
     Status Heartbeat(ServerContext *context, const HeartbeatRequest *request, HeartbeatResponse *response) override
     {
+        RpcMetricTimer metric(*this, "Heartbeat");
+        const auto authorization = Authorize(context, "node");
+        if (!authorization.ok())
+            return authorization;
         if (request->leader_port() != node_id && !IsConfiguredPeer(request->leader_port()))
-            return Status(grpc::StatusCode::PERMISSION_DENIED, "heartbeat sender is not a configured peer");
+            return RpcError("Heartbeat", grpc::StatusCode::PERMISSION_DENIED,
+                            "heartbeat sender is not a configured peer");
 
         std::lock_guard<std::mutex> lock(election_mutex);
         if (request->leader_term() < current_term)
@@ -1709,7 +2181,7 @@ public:
             }
             catch (const std::exception &error)
             {
-                return Status(grpc::StatusCode::INTERNAL, error.what());
+                return RpcError("Heartbeat", grpc::StatusCode::INTERNAL, error.what());
             }
         }
         state = NodeState::FOLLOWER;
@@ -1724,12 +2196,17 @@ public:
 
     Status Get(ServerContext *context, const GetRequest *request, GetResponse *response) override
     {
+        RpcMetricTimer metric(*this, "Get");
+        const auto authorization = Authorize(context, "read");
+        if (!authorization.ok())
+            return authorization;
         if (state == NodeState::LEADER && request->consistency() == kvstore::ReadConsistency::STRONG &&
             !ConfirmLinearizableRead())
-            return Status(grpc::StatusCode::UNAVAILABLE, "leader cannot confirm a quorum for a linearizable read");
+            return RpcError("Get", grpc::StatusCode::UNAVAILABLE,
+                            "leader cannot confirm a quorum for a linearizable read");
 
         if (state == NodeState::LEADER && !leader_ready)
-            return Status(grpc::StatusCode::UNAVAILABLE, "leader is not ready to serve requests");
+            return RpcError("Get", grpc::StatusCode::UNAVAILABLE, "leader is not ready to serve requests");
 
         if (state != NodeState::LEADER && !peer_stubs.empty())
         {
@@ -1757,6 +2234,7 @@ public:
                 GetResponse forwarded_response;
                 ClientContext ctx;
                 ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                AddForwardedAuth(context, ctx);
                 const auto status = leader_stub->Get(&ctx, forwarded, &forwarded_response);
                 if (status.ok())
                 {
@@ -1764,7 +2242,8 @@ public:
                     return Status::OK;
                 }
             }
-            return Status(grpc::StatusCode::UNAVAILABLE, "leader is unavailable for a linearizable read");
+            return RpcError("Get", grpc::StatusCode::UNAVAILABLE,
+                            "leader is unavailable for a linearizable read");
         }
 
         std::lock_guard<std::mutex> lock(store_mutex);
@@ -1784,12 +2263,18 @@ public:
 
     Status ListKeys(ServerContext *context, const ListKeysRequest *request, ListKeysResponse *response) override
     {
+        RpcMetricTimer metric(*this, "ListKeys");
+        const auto authorization = Authorize(context, "read");
+        if (!authorization.ok())
+            return authorization;
         if (state == NodeState::LEADER && request->consistency() == kvstore::ReadConsistency::STRONG &&
             !ConfirmLinearizableRead())
-            return Status(grpc::StatusCode::UNAVAILABLE, "leader cannot confirm a quorum for a linearizable read");
+            return RpcError("ListKeys", grpc::StatusCode::UNAVAILABLE,
+                            "leader cannot confirm a quorum for a linearizable read");
 
         if (state == NodeState::LEADER && !leader_ready)
-            return Status(grpc::StatusCode::UNAVAILABLE, "leader is not ready to serve requests");
+            return RpcError("ListKeys", grpc::StatusCode::UNAVAILABLE,
+                            "leader is not ready to serve requests");
 
         if (state != NodeState::LEADER && !peer_stubs.empty())
         {
@@ -1818,6 +2303,7 @@ public:
                 ListKeysResponse forwarded_response;
                 ClientContext ctx;
                 ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                AddForwardedAuth(context, ctx);
                 const auto status = leader_stub->ListKeys(&ctx, forwarded, &forwarded_response);
                 if (status.ok())
                 {
@@ -1829,7 +2315,8 @@ public:
 
         if (state != NodeState::LEADER && !peer_stubs.empty() &&
             request->consistency() == kvstore::ReadConsistency::STRONG)
-            return Status(grpc::StatusCode::UNAVAILABLE, "leader is unavailable for a linearizable read");
+            return RpcError("ListKeys", grpc::StatusCode::UNAVAILABLE,
+                            "leader is unavailable for a linearizable read");
 
         std::lock_guard<std::mutex> lock(store_mutex);
         std::vector<std::string> keys;
@@ -1849,6 +2336,10 @@ public:
 
     Status GetClusterStatus(ServerContext *context, const ClusterStatusRequest *request, ClusterStatusResponse *response) override
     {
+        RpcMetricTimer metric(*this, "GetClusterStatus");
+        const auto authorization = Authorize(context, "monitor");
+        if (!authorization.ok())
+            return authorization;
         const int leader_id = state == NodeState::LEADER ? node_id : known_leader_id;
         response->set_node_id(node_id);
         response->set_current_term(current_term);
@@ -1860,12 +2351,17 @@ public:
 
     Status Set(ServerContext *context, const SetRequest *request, SetResponse *response) override
     {
+        RpcMetricTimer metric(*this, "Set");
+        const auto authorization = Authorize(context, "write");
+        if (!authorization.ok())
+            return authorization;
         if (request->key().empty() || request->key().size() > kMaxKeyBytes ||
             request->value().size() > kMaxValueBytes ||
             request->request_id().size() > kMaxRequestIdBytes ||
             request->client_id().size() > kMaxRequestIdBytes ||
             (request->client_id().empty() != (request->request_sequence() == 0)))
-            return Status(grpc::StatusCode::INVALID_ARGUMENT, "key/value/request ID exceeds configured limits");
+            return RpcError("Set", grpc::StatusCode::INVALID_ARGUMENT,
+                            "key/value/request ID exceeds configured limits");
 
         std::lock_guard<std::mutex> write_lock(client_write_mutex);
         const std::string identity = WriteIdentity(request->request_id(), request->client_id(),
@@ -1881,8 +2377,8 @@ public:
             return Status::OK;
         }
         if (IsStaleClientSequence(request->client_id(), request->request_sequence()))
-            return Status(grpc::StatusCode::FAILED_PRECONDITION,
-                          "client request sequence is older than the committed session");
+            return RpcError("Set", grpc::StatusCode::FAILED_PRECONDITION,
+                            "client request sequence is older than the committed session");
 
         if (state == NodeState::LEADER && !leader_ready)
         {
@@ -1903,11 +2399,13 @@ public:
                 SetResponse forwarded_response;
                 ClientContext ctx;
                 ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                AddForwardedAuth(context, ctx);
                 const auto status = leader_stub->Set(&ctx, forwarded, &forwarded_response);
                 if (status.ok())
                 {
                     if (!forwarded_response.success())
-                        std::cerr << "Leader rejected forwarded write from node " << node_id << std::endl;
+                        LogEvent("warn", 2, "forwarded_write_rejected",
+                                 {{"node_id", std::to_string(node_id)}});
                     response->set_success(forwarded_response.success());
                     response->set_leader_id(forwarded_response.leader_id());
                     response->set_request_id(forwarded_response.request_id());
@@ -1915,11 +2413,13 @@ public:
                     response->set_request_sequence(forwarded_response.request_sequence());
                     return Status::OK;
                 }
-                std::cerr << "Forwarded write from node " << node_id << " failed: "
-                          << status.error_message() << std::endl;
+                LogEvent("warn", 2, "forwarded_write_failed",
+                         {{"node_id", std::to_string(node_id)},
+                          {"error", status.error_message()}});
             }
             else
-                std::cerr << "No leader found while forwarding write from node " << node_id << std::endl;
+                LogEvent("warn", 2, "forwarded_write_leader_unavailable",
+                         {{"node_id", std::to_string(node_id)}});
             response->set_success(false);
             response->set_leader_id(known_leader_id);
             response->set_request_id(request->request_id());
@@ -1946,11 +2446,16 @@ public:
 
     Status Delete(ServerContext *context, const DeleteRequest *request, DeleteResponse *response) override
     {
+        RpcMetricTimer metric(*this, "Delete");
+        const auto authorization = Authorize(context, "write");
+        if (!authorization.ok())
+            return authorization;
         if (request->key().empty() || request->key().size() > kMaxKeyBytes ||
             request->request_id().size() > kMaxRequestIdBytes ||
             request->client_id().size() > kMaxRequestIdBytes ||
             (request->client_id().empty() != (request->request_sequence() == 0)))
-            return Status(grpc::StatusCode::INVALID_ARGUMENT, "key/request ID exceeds configured limits");
+            return RpcError("Delete", grpc::StatusCode::INVALID_ARGUMENT,
+                            "key/request ID exceeds configured limits");
 
         std::lock_guard<std::mutex> write_lock(client_write_mutex);
         const std::string identity = WriteIdentity(request->request_id(), request->client_id(),
@@ -1966,8 +2471,8 @@ public:
             return Status::OK;
         }
         if (IsStaleClientSequence(request->client_id(), request->request_sequence()))
-            return Status(grpc::StatusCode::FAILED_PRECONDITION,
-                          "client request sequence is older than the committed session");
+            return RpcError("Delete", grpc::StatusCode::FAILED_PRECONDITION,
+                            "client request sequence is older than the committed session");
 
         if (state == NodeState::LEADER && !leader_ready)
         {
@@ -1988,6 +2493,7 @@ public:
                 DeleteResponse forwarded_response;
                 ClientContext ctx;
                 ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                AddForwardedAuth(context, ctx);
                 const auto status = leader_stub->Delete(&ctx, forwarded, &forwarded_response);
                 if (status.ok())
                 {
@@ -2024,17 +2530,169 @@ public:
     }
 };
 
-bool RunServer(const std::string &port, const std::vector<std::string> &peer_addresses,
+class MetricsHttpServer
+{
+public:
+    ~MetricsHttpServer()
+    {
+        Stop();
+    }
+
+    void Start(const std::string &bind_address, const std::string &port,
+               const KVStoreServiceImpl &service)
+    {
+        const int port_number = ParsePortNumber(port, "metrics");
+        const int descriptor = socket(AF_INET, SOCK_STREAM, 0);
+        if (descriptor < 0)
+            throw std::runtime_error("failed to create metrics listener socket");
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(static_cast<std::uint16_t>(port_number));
+        if (inet_pton(AF_INET, bind_address.c_str(), &address.sin_addr) != 1)
+        {
+            close(descriptor);
+            throw std::runtime_error("metrics_bind must be an IPv4 address");
+        }
+        int reuse_address = 1;
+        if (setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR,
+                       &reuse_address, sizeof(reuse_address)) < 0)
+        {
+            const int error = errno;
+            close(descriptor);
+            throw std::runtime_error("failed to configure metrics listener: " +
+                                     std::string(std::strerror(error)));
+        }
+        if (bind(descriptor, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0 ||
+            listen(descriptor, 16) < 0)
+        {
+            const int error = errno;
+            close(descriptor);
+            throw std::runtime_error("failed to start metrics listener: " +
+                                     std::string(std::strerror(error)));
+        }
+        listener_.store(descriptor);
+        running_ = true;
+        worker_ = std::thread([this, &service]() { Serve(service); });
+        LogEvent("info", 1, "metrics_listener_started",
+                 {{"bind", bind_address}, {"port", port}});
+    }
+
+    void Stop()
+    {
+        running_ = false;
+        const int descriptor = listener_.exchange(-1);
+        if (descriptor >= 0)
+        {
+            shutdown(descriptor, SHUT_RDWR);
+            close(descriptor);
+        }
+        if (worker_.joinable())
+            worker_.join();
+    }
+
+private:
+    std::atomic<bool> running_{false};
+    std::atomic<int> listener_{-1};
+    std::thread worker_;
+
+    static void SendResponse(int descriptor, int status, const std::string &body)
+    {
+        const std::string reason = status == 200 ? "OK" : "Not Found";
+        const std::string response =
+            "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n"
+            "Content-Type: " + (status == 200 ? "text/plain; version=0.0.4; charset=utf-8" :
+                                               "text/plain; charset=utf-8") + "\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n\r\n" + body;
+        std::size_t sent = 0;
+        while (sent < response.size())
+        {
+#ifdef MSG_NOSIGNAL
+            const auto count = send(descriptor, response.data() + sent,
+                                    response.size() - sent, MSG_NOSIGNAL);
+#else
+            const auto count = send(descriptor, response.data() + sent,
+                                    response.size() - sent, 0);
+#endif
+            if (count <= 0)
+                return;
+            sent += static_cast<std::size_t>(count);
+        }
+    }
+
+    void Serve(const KVStoreServiceImpl &service)
+    {
+        while (running_)
+        {
+            const int listener = listener_.load();
+            if (listener < 0)
+                break;
+            const int client = accept(listener, nullptr, nullptr);
+            if (client < 0)
+            {
+                if (!running_ || errno == EINTR)
+                    continue;
+                LogEvent("error", 3, "metrics_accept_failed",
+                         {{"error", std::strerror(errno)}});
+                continue;
+            }
+            timeval timeout{1, 0};
+            if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+                setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0)
+            {
+                LogEvent("warn", 2, "metrics_client_timeout_setup_failed",
+                         {{"error", std::strerror(errno)}});
+                close(client);
+                continue;
+            }
+            char request[1024]{};
+            const auto received = recv(client, request, sizeof(request) - 1, 0);
+            const std::string request_line = received > 0 ? std::string(request, received) : "";
+            if (request_line.rfind("GET /metrics HTTP/1.", 0) == 0)
+                SendResponse(client, 200, service.RenderMetrics());
+            else
+                SendResponse(client, 404, "not found\n");
+            close(client);
+        }
+    }
+};
+
+bool RunServer(const std::string &bind_address, const std::string &port,
+               const std::string &metrics_bind, const std::string &metrics_port,
+               const std::vector<std::string> &peer_addresses,
                const std::vector<int> &peer_ids, const TlsConfig &tls_config,
                const std::filesystem::path &membership_path,
                const std::filesystem::path &data_root)
 {
-    std::string server_address = "0.0.0.0:" + port;
+    const std::string server_address =
+        (bind_address == "::" || bind_address == "[::]")
+            ? "[::]:" + port
+            : bind_address + ":" + port;
     KVStoreServiceImpl service(std::stoi(port), peer_addresses, peer_ids,
                                data_root / ("node_" + port), tls_config,
                                membership_path);
+    MetricsHttpServer metrics_http;
+    if (!metrics_port.empty())
+        metrics_http.Start(metrics_bind, metrics_port, service);
+
+    int shutdown_pipe[2];
+    if (pipe(shutdown_pipe) != 0)
+        throw std::runtime_error("failed to create graceful-shutdown signal pipe");
+    for (const int descriptor : shutdown_pipe)
+    {
+        const int flags = fcntl(descriptor, F_GETFL, 0);
+        if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) < 0)
+        {
+            close(shutdown_pipe[0]);
+            close(shutdown_pipe[1]);
+            throw std::runtime_error("failed to configure graceful-shutdown signal pipe");
+        }
+    }
 
     ServerBuilder builder;
+    builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 64);
+    builder.SetMaxReceiveMessageSize(16 * 1024 * 1024);
     if (tls_config.Enabled())
     {
         grpc::SslServerCredentialsOptions options;
@@ -2059,18 +2717,65 @@ bool RunServer(const std::string &port, const std::vector<std::string> &peer_add
     // on server->Wait() below.
     if (!server)
     {
-        std::cerr << "Failed to start server on " << server_address
-                  << " - the port may already be in use." << std::endl;
+        close(shutdown_pipe[0]);
+        close(shutdown_pipe[1]);
+        LogEvent("error", 3, "grpc_listener_start_failed",
+                 {{"address", server_address}, {"reason", "port may already be in use"}});
         return false;
     }
 
-    std::cout << "Server listening on " << server_address << " [starting as FOLLOWER]" << std::endl;
+    LogEvent("info", 1, "grpc_listener_started",
+             {{"address", server_address}, {"node_id", std::to_string(port)}});
+    termination_signal = 0;
+    shutdown_wakeup_fd = shutdown_pipe[1];
+    std::signal(SIGINT, HandleTerminationSignal);
+    std::signal(SIGTERM, HandleTerminationSignal);
+    std::atomic<bool> wait_complete{false};
+    std::thread shutdown_watcher([&]() {
+        pollfd wakeup{shutdown_pipe[0], POLLIN, 0};
+        while (poll(&wakeup, 1, -1) < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            LogEvent("error", 3, "graceful_shutdown_wait_failed",
+                     {{"error", std::strerror(errno)}});
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            return;
+        }
+        if (!wait_complete.load() && termination_signal != 0)
+        {
+            LogEvent("info", 1, "graceful_shutdown_started",
+                     {{"signal", std::to_string(termination_signal)}});
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(10));
+        }
+    });
     server->Wait();
+    wait_complete = true;
+    const char wakeup = 0;
+    const auto ignored = write(shutdown_pipe[1], &wakeup, sizeof(wakeup));
+    (void)ignored;
+    shutdown_watcher.join();
+    std::signal(SIGINT, SIG_DFL);
+    std::signal(SIGTERM, SIG_DFL);
+    shutdown_wakeup_fd = -1;
+    close(shutdown_pipe[0]);
+    close(shutdown_pipe[1]);
+    metrics_http.Stop();
+    LogEvent("info", 1, "server_shutdown_complete", {{"node_id", port}});
     return true;
 }
 
 int main(int argc, char **argv)
 {
+    try
+    {
+        ConfigureLogLevel();
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << error.what() << std::endl;
+        return 2;
+    }
     // Usage: server.exe <port> <peer1_port> <peer2_port> ... [options]
     // Or: server.exe --config node.conf
     if (argc < 2)
@@ -2093,6 +2798,9 @@ int main(int argc, char **argv)
         runtime_config = LoadRuntimeConfig(config_path);
 
     std::string port = runtime_config.port;
+    std::string bind_address = runtime_config.bind;
+    std::string metrics_port = runtime_config.metrics_port;
+    std::string metrics_bind = runtime_config.metrics_bind;
     std::vector<std::string> peer_addresses;
     std::vector<int> peer_ids;
     TlsConfig tls_config;
@@ -2101,6 +2809,9 @@ int main(int argc, char **argv)
     tls_config.ca_file = runtime_config.ca_file;
     tls_config.certificate_file = runtime_config.certificate_file;
     tls_config.private_key_file = runtime_config.private_key_file;
+    tls_config.auth_file = runtime_config.auth_file.string();
+    tls_config.token_file = runtime_config.token_file.string();
+    bool insecure_dev = false;
     bool invalid_peer_endpoint = false;
 
     auto add_peer = [&](const std::string &peer) {
@@ -2145,6 +2856,36 @@ int main(int argc, char **argv)
             data_root = argv[++i];
             continue;
         }
+        if (std::string(argv[i]) == "--bind" && i + 1 < argc)
+        {
+            bind_address = argv[++i];
+            continue;
+        }
+        if (std::string(argv[i]) == "--metrics-port" && i + 1 < argc)
+        {
+            metrics_port = argv[++i];
+            continue;
+        }
+        if (std::string(argv[i]) == "--metrics-bind" && i + 1 < argc)
+        {
+            metrics_bind = argv[++i];
+            continue;
+        }
+        if (std::string(argv[i]) == "--auth-file" && i + 1 < argc)
+        {
+            tls_config.auth_file = argv[++i];
+            continue;
+        }
+        if (std::string(argv[i]) == "--token-file" && i + 1 < argc)
+        {
+            tls_config.token_file = argv[++i];
+            continue;
+        }
+        if (std::string(argv[i]) == "--insecure-dev")
+        {
+            insecure_dev = true;
+            continue;
+        }
         if (std::string(argv[i]) == "--ca" && i + 1 < argc)
         {
             tls_config.ca_file = argv[++i];
@@ -2177,8 +2918,34 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (tls_config.auth_file.empty() != tls_config.token_file.empty())
+    {
+        std::cerr << "--auth-file and --token-file must be configured together." << std::endl;
+        return 2;
+    }
+
+    const bool loopback_bind = bind_address == "localhost" || bind_address == "127.0.0.1" ||
+                               bind_address == "::1" || bind_address == "[::1]";
+    if (insecure_dev)
+    {
+        if (!loopback_bind)
+        {
+            std::cerr << "--insecure-dev is restricted to loopback binds." << std::endl;
+            return 2;
+        }
+    }
+    else if (!tls_config.Enabled() || tls_config.auth_file.empty())
+    {
+        std::cerr << "TLS/mTLS and RPC authorization are required; use --insecure-dev only for local development."
+                  << std::endl;
+        return 2;
+    }
+
     RuntimeConfig effective_config = runtime_config;
     effective_config.port = port;
+    effective_config.bind = bind_address;
+    effective_config.metrics_port = metrics_port;
+    effective_config.metrics_bind = metrics_bind;
     effective_config.peers = peer_addresses;
     try
     {
@@ -2191,6 +2958,15 @@ int main(int argc, char **argv)
     }
 
     if (tls_config.Enabled())
-        std::cout << "TLS/mTLS enabled" << std::endl;
-    return RunServer(port, peer_addresses, peer_ids, tls_config, membership_path, data_root) ? 0 : 1;
+        LogEvent("info", 1, "transport_security_enabled");
+    try
+    {
+        return RunServer(bind_address, port, metrics_bind, metrics_port, peer_addresses, peer_ids, tls_config,
+                         membership_path, data_root) ? 0 : 1;
+    }
+    catch (const std::exception &error)
+    {
+        LogEvent("error", 3, "server_startup_failed", {{"error", error.what()}});
+        return 1;
+    }
 }

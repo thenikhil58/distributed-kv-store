@@ -54,12 +54,12 @@ for node_port in "${node_ports[@]}"; do
 			peer_ports+=("$peer_port")
 		fi
 	done
-	./build/server "$node_port" "${peer_ports[@]}" --data-root "$RUNTIME_DATA" > "/tmp/kv-node-${node_port}.log" 2>&1 &
+	./build/server "$node_port" "${peer_ports[@]}" --data-root "$RUNTIME_DATA" --insecure-dev > "/tmp/kv-node-${node_port}.log" 2>&1 &
 done
 
 # Start UI and gateway.
 python3 -m http.server "$UI_PORT" --directory web > /tmp/kv-ui.log 2>&1 &
-gateway_args=(--host "$GATEWAY_HOST" --target "$GATEWAY_TARGET" --port "$GATEWAY_PORT")
+gateway_args=(--host "$GATEWAY_HOST" --target "$GATEWAY_TARGET" --port "$GATEWAY_PORT" --insecure-dev)
 if [[ "${GATEWAY_ALLOW_PUBLIC:-0}" != "0" ]]; then
 	gateway_args+=(--allow-public)
 fi

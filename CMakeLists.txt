@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
-project(DistributedKVStore CXX)
+project(DistributedKVStore VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+include(GNUInstallDirs)
 
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
@@ -34,6 +35,7 @@ endif()
 find_package(gRPC CONFIG REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(GTest REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 add_executable(server
     server.cpp
@@ -51,6 +53,7 @@ target_link_libraries(server
     PRIVATE
     gRPC::grpc++
     protobuf::libprotobuf
+    OpenSSL::Crypto
 )
 
 add_executable(client
@@ -109,6 +112,7 @@ target_link_libraries(raft_tests
     gRPC::grpc++
     protobuf::libprotobuf
     GTest::gtest_main
+    OpenSSL::Crypto
 )
 
 target_link_libraries(runtime_config_tests
@@ -121,3 +125,22 @@ add_test(NAME runtime_config_tests COMMAND runtime_config_tests)
 set_tests_properties(raft_tests runtime_config_tests PROPERTIES TIMEOUT 180)
 
 enable_testing()
+
+install(TARGETS server client
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+if(BUILD_BENCHMARKS)
+    install(TARGETS kvstore_benchmark
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+install(FILES config/node.conf.example
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/distributed-kv-store
+)
+
+set(CPACK_PACKAGE_NAME "distributed-kv-store")
+set(CPACK_PACKAGE_VENDOR "thenikhil58")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Experimental Raft-based distributed key-value store")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_GENERATOR "TGZ")
+include(CPack)

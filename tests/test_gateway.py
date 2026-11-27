@@ -1,6 +1,7 @@
 import http.cookiejar
 import json
 import os
+import socket
 import threading
 import tempfile
 import unittest
@@ -97,6 +98,9 @@ class GatewayHttpTests(unittest.TestCase):
 
     def setUp(self):
         self.store.clear()
+        gateway.GatewayHandler.rate_limit_window_seconds = gateway.RATE_LIMIT_WINDOW_SECONDS
+        gateway.GatewayHandler.rate_limit_max_requests = gateway.RATE_LIMIT_MAX_REQUESTS
+        gateway.GatewayHandler._login_bucket = {}
 
     def test_dashboard_origin_uses_configured_ui_port(self):
         environment = {
@@ -134,6 +138,33 @@ class GatewayHttpTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires --users-file"):
             gateway.validate_gateway_security("0.0.0.0", None, allow_public=True)
         self.assertTrue(gateway.validate_gateway_security("127.0.0.1", None))
+
+    def test_grpc_token_file_permissions_and_loopback_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = gateway.Path(directory) / "token"
+            path.write_text("test-token-value-with-more-than-32-bytes\n", encoding="utf-8")
+            os.chmod(path, 0o644)
+            if os.name == "posix":
+                with self.assertRaisesRegex(ValueError, "must be private"):
+                    gateway.read_secret(path)
+            os.chmod(path, 0o600)
+            self.assertEqual(gateway.read_secret(path), "test-token-value-with-more-than-32-bytes")
+        self.assertTrue(gateway.is_loopback_target("localhost:50051"))
+        self.assertFalse(gateway.is_loopback_target("kv-node.internal:50051"))
+
+    def test_gateway_rejects_connections_above_worker_limit(self):
+        server = gateway.BoundedThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+        acquired = [server._request_slots.acquire(blocking=False) for _ in range(gateway.MAX_HTTP_WORKERS)]
+        self.assertTrue(all(acquired))
+        client, server_socket = socket.socketpair()
+        try:
+            server.process_request(server_socket, ("127.0.0.1", 1))
+            self.assertTrue(client.recv(1024).startswith(b"HTTP/1.1 503"))
+        finally:
+            client.close()
+            for _ in acquired:
+                server._request_slots.release()
+            server.server_close()
 
     def client(self):
         cookies = http.cookiejar.CookieJar()
@@ -246,6 +277,10 @@ class GatewayHttpTests(unittest.TestCase):
         )
         self.assertIn(
             'kvstore_http_responses_total{method="POST",status="200"}',
+            metrics,
+        )
+        self.assertIn(
+            'kvstore_http_request_duration_seconds_count{method="GET",status="200"}',
             metrics,
         )
 
