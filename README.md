@@ -21,7 +21,7 @@ production database.
   persistence, leader failover, and forwarding.
 - **Browser console:** a Python HTTP gateway translates dashboard requests into gRPC calls to the C++
   service.
-- **Optional security and operations features:** mutual TLS, dashboard accounts with isolated key
+- **Security and operations features:** mutual TLS and role-authorized direct gRPC access, dashboard accounts with isolated key
   namespaces, JSON backup/restore, health endpoints, and request counters.
 
 ## Architecture
@@ -96,18 +96,22 @@ commands, see [Testing guide](docs/TESTING.md).
 | `web/` | Operator dashboard |
 | `start.sh`, `stop.sh` | Local demo lifecycle |
 | `tests/` | C++ integration/configuration and Python gateway tests |
-| `benchmarks/` | Basic end-to-end write throughput client |
+| `benchmarks/` | Concurrent end-to-end workload benchmark and repeatable JSONL matrix runner |
 
 ## Important limitations
 
 Cluster membership is static; reloading peer endpoints does not implement safe Raft membership
-changes. Dashboard authentication does not authenticate direct gRPC clients. `EVENTUAL` reads can
-be stale, and the project's current behavior has not been independently validated as production
-safe. Keep the demo on trusted networks and use disposable data.
+changes. Dashboard login is separate from direct gRPC mTLS and role-token credentials.
+Credential rotation and optional key-prefix scopes are operator-managed controls, not
+independently reviewed security guarantees. See [the security guide](docs/SECURITY.md)
+and [release gates](docs/RELEASE-PROCESS.md).
+`EVENTUAL` reads can be stale, and the project's current behavior has not been independently
+validated as production safe. The `start.sh` demo explicitly uses loopback-only plaintext
+development mode; do not use it for production or expose it remotely.
 
-Read [the consistency model](docs/CONSISTENCY-MODEL.md) and
-[production readiness notes](docs/PRODUCTION-READINESS.md) before considering any deployment
-beyond local experimentation.
+Read [the consistency model](docs/CONSISTENCY-MODEL.md), [security setup](docs/SECURITY.md),
+[operations runbook](docs/OPERATIONS.md), and [production readiness notes](docs/PRODUCTION-READINESS.md)
+before considering any deployment beyond local experimentation.
 
 ## License
 

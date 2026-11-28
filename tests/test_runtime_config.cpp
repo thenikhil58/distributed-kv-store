@@ -15,9 +15,15 @@ TEST(RuntimeConfig, ParsesValuesAndPeerLists)
                << "peers = localhost:50052, localhost:50053\n"
                << "data_root = ./state\n"
                << "peers_file = peers.txt\n"
+               << "auth_file = auth.conf\n"
+               << "token_file = node.token\n"
+               << "bind = 127.0.0.1\n"
+               << "metrics_port = 60051\n"
+               << "metrics_bind = 127.0.0.1\n"
                << "ca = ca.pem\n"
                << "cert = node.pem\n"
-               << "key = node.key\n";
+               << "key = node.key\n"
+               << "crl_directory = crls\n";
     }
 
     const auto config = LoadRuntimeConfig(path);
@@ -27,9 +33,15 @@ TEST(RuntimeConfig, ParsesValuesAndPeerLists)
     EXPECT_EQ(config.peers[1], "localhost:50053");
     EXPECT_EQ(config.data_root, "./state");
     EXPECT_EQ(config.peers_file, "peers.txt");
+    EXPECT_EQ(config.auth_file, "auth.conf");
+    EXPECT_EQ(config.token_file, "node.token");
+    EXPECT_EQ(config.bind, "127.0.0.1");
+    EXPECT_EQ(config.metrics_port, "60051");
+    EXPECT_EQ(config.metrics_bind, "127.0.0.1");
     EXPECT_EQ(config.ca_file, "ca.pem");
     EXPECT_EQ(config.certificate_file, "node.pem");
     EXPECT_EQ(config.private_key_file, "node.key");
+    EXPECT_EQ(config.crl_directory, "crls");
     std::filesystem::remove(path);
 }
 
@@ -87,6 +99,28 @@ TEST(RuntimeConfig, RejectsPartialTlsConfiguration)
     }
     EXPECT_THROW(LoadRuntimeConfig(path), std::runtime_error);
     std::filesystem::remove(path);
+}
+
+TEST(RuntimeConfig, RejectsPartialAuthorizationConfiguration)
+{
+    RuntimeConfig config;
+    config.auth_file = "auth.conf";
+    EXPECT_THROW(ValidateRuntimeConfig(config), std::runtime_error);
+}
+
+TEST(RuntimeConfig, RequiresCrlDirectoryWithTlsCredentials)
+{
+    RuntimeConfig config;
+    config.ca_file = "ca.pem";
+    config.certificate_file = "node.pem";
+    config.private_key_file = "node.key";
+    EXPECT_NO_THROW(ValidateRuntimeConfig(config));
+    config.crl_directory = "crls";
+    EXPECT_NO_THROW(ValidateRuntimeConfig(config));
+    config.ca_file.clear();
+    config.certificate_file.clear();
+    config.private_key_file.clear();
+    EXPECT_THROW(ValidateRuntimeConfig(config), std::runtime_error);
 }
 
 TEST(RuntimeConfig, RejectsInvalidNodePort)

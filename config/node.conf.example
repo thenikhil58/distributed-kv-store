@@ -1,8 +1,16 @@
 # Copy this file to a node-specific path before starting the server.
+# Keep the node on loopback unless its private network and firewall are configured.
+bind = 127.0.0.1
 port = 50051
+metrics_bind = 127.0.0.1
+# Choose a distinct metrics port for each node.
+metrics_port = 60051
 peers = localhost:50052, localhost:50053
 data_root = data
 # peers_file = peers-50051.txt
-# ca = certs/ca.pem
-# cert = certs/node-50051.pem
-# key = certs/node-50051-key.pem
+# ca = /etc/raft-kv/pki/ca-bundle.pem
+# cert = /etc/raft-kv/pki/node-50051.pem
+# key = /etc/raft-kv/pki/node-50051-key.pem
+# crl_directory = /etc/raft-kv/pki/crls
+# auth_file = /etc/raft-kv/auth/tokens.conf
+# token_file = /etc/raft-kv/auth/node.token

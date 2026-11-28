@@ -1,7 +1,6 @@
 #include <chrono>
 #include <algorithm>
 #include <iostream>
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <random>
@@ -12,6 +11,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include "kvstore.grpc.pb.h"
+#include "file_credentials.h"
 
 using grpc::ClientContext;
 using grpc::Status;
@@ -27,20 +27,14 @@ struct TlsConfig
     std::string ca_file;
     std::string certificate_file;
     std::string private_key_file;
+    std::string token_file;
+    std::string crl_directory;
 
     bool Enabled() const
     {
         return !ca_file.empty() && !certificate_file.empty() && !private_key_file.empty();
     }
 };
-
-static std::string ReadTextFile(const std::string &path)
-{
-    std::ifstream input(path);
-    if (!input)
-        throw std::runtime_error("failed to read TLS file: " + path);
-    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-}
 
 // A thin wrapper around the generated gRPC stub, exposing simple
 // Set()/Get() methods for interacting with the KV store cluster.
@@ -215,6 +209,7 @@ public:
 int main(int argc, char **argv)
 {
     TlsConfig tls_config;
+    bool insecure_dev = false;
     std::vector<std::string> addresses = {"localhost:50051"};
     for (int i = 1; i < argc; ++i)
     {
@@ -230,6 +225,12 @@ int main(int argc, char **argv)
             tls_config.certificate_file = argv[++i];
         else if (std::string(argv[i]) == "--key" && i + 1 < argc)
             tls_config.private_key_file = argv[++i];
+        else if (std::string(argv[i]) == "--token-file" && i + 1 < argc)
+            tls_config.token_file = argv[++i];
+        else if (std::string(argv[i]) == "--crl-directory" && i + 1 < argc)
+            tls_config.crl_directory = argv[++i];
+        else if (std::string(argv[i]) == "--insecure-dev")
+            insecure_dev = true;
     }
 
     const bool any_tls = !tls_config.ca_file.empty() ||
@@ -240,19 +241,57 @@ int main(int argc, char **argv)
         std::cerr << "--ca, --cert, and --key must be provided together." << std::endl;
         return 2;
     }
+    if (tls_config.Enabled() != !tls_config.token_file.empty() ||
+        (!tls_config.Enabled() && !tls_config.crl_directory.empty()))
+    {
+        std::cerr << "mTLS and --token-file are required together; --crl-directory requires mTLS."
+                  << std::endl;
+        return 2;
+    }
+
+    if (insecure_dev)
+    {
+        for (const auto &address : addresses)
+        {
+            const auto separator = address.rfind(':');
+            const auto host = separator == std::string::npos ? address : address.substr(0, separator);
+            if (host != "localhost" && host != "127.0.0.1" &&
+                host != "[::1]" && host != "::1")
+            {
+                std::cerr << "--insecure-dev is restricted to loopback addresses." << std::endl;
+                return 2;
+            }
+        }
+    }
+    else if (!tls_config.Enabled())
+    {
+        std::cerr << "mTLS and --token-file are required; use --insecure-dev only for local development."
+                  << std::endl;
+        return 2;
+    }
 
     std::shared_ptr<grpc::ChannelCredentials> credentials;
-    if (tls_config.Enabled())
+    try
     {
-        grpc::SslCredentialsOptions options;
-        options.pem_root_certs = ReadTextFile(tls_config.ca_file);
-        options.pem_cert_chain = ReadTextFile(tls_config.certificate_file);
-        options.pem_private_key = ReadTextFile(tls_config.private_key_file);
-        credentials = grpc::SslCredentials(options);
+        if (tls_config.Enabled())
+        {
+            credentials = kvstore_credentials::CreateChannelCredentials(
+                tls_config.ca_file, tls_config.certificate_file,
+                tls_config.private_key_file, tls_config.crl_directory);
+            if (!tls_config.token_file.empty())
+                credentials = grpc::CompositeChannelCredentials(
+                    credentials, kvstore_credentials::CreateFileTokenCredentials(
+                                     tls_config.token_file));
+        }
+        else
+        {
+            credentials = grpc::InsecureChannelCredentials();
+        }
     }
-    else
+    catch (const std::exception &error)
     {
-        credentials = grpc::InsecureChannelCredentials();
+        std::cerr << "Failed to load client credentials: " << error.what() << std::endl;
+        return 2;
     }
 
     KVStoreClient client(addresses, credentials);

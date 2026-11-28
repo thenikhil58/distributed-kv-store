@@ -7,6 +7,9 @@
 #include <iostream>
 #include <algorithm>
 #include <string>
+#include <iomanip>
+#include <sstream>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <thread>
@@ -14,6 +17,7 @@
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
+#include <openssl/sha.h>
 
 #include "../kvstore.grpc.pb.h"
 
@@ -81,13 +85,26 @@ bool WaitForLeader(const std::string& address, int timeout_seconds = 10) {
     return false;
 }
 
-pid_t StartServer(const std::string& port, const std::vector<std::string>& peers) {
+std::string Sha256HexForTest(const std::string& value) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), digest);
+    std::ostringstream result;
+    for (const auto byte : digest) {
+        result << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+    return result.str();
+}
+
+pid_t StartServer(const std::string& port, const std::vector<std::string>& peers,
+                  const std::vector<std::string>& options = {}) {
     std::vector<std::string> argv;
     argv.push_back(ResolveServerBinary());
     argv.push_back(port);
     for (const auto& peer : peers) {
         argv.push_back(peer);
     }
+    argv.push_back("--insecure-dev");
+    argv.insert(argv.end(), options.begin(), options.end());
 
     std::vector<char*> cargs;
     for (auto& arg : argv) {
@@ -106,19 +123,21 @@ pid_t StartServer(const std::string& port, const std::vector<std::string>& peers
 
 void StopServer(pid_t pid) {
     if (pid > 0) {
+        kill(pid, SIGCONT);
         kill(pid, SIGTERM);
         waitpid(pid, nullptr, 0);
     }
 }
 
 struct TestServer {
-    explicit TestServer(const std::string& port, bool reset_storage = true)
+    explicit TestServer(const std::string& port, bool reset_storage = true,
+                        const std::vector<std::string>& options = {})
         : port(port), pid(-1) {
         if (reset_storage) {
             std::error_code error;
             std::filesystem::remove_all(std::filesystem::path("data") / ("node_" + port), error);
         }
-        pid = StartServer(port, {});
+        pid = StartServer(port, {}, options);
     }
 
     ~TestServer() {
@@ -148,6 +167,7 @@ struct TestCluster {
 
     ~TestCluster() {
         for (const auto pid : pids) {
+            kill(pid, SIGCONT);
             StopServer(pid);
         }
     }
@@ -184,6 +204,179 @@ TEST(RaftIntegration, LeaderSetAndGetRoundTrip) {
     ASSERT_TRUE(get_resp.found());
     EXPECT_EQ(get_resp.value(), "beta");
 
+}
+
+TEST(RaftIntegration, RpcTokensEnforceAuthenticationAndLeastPrivilege) {
+    const std::string read_token = "read-token-for-test-0123456789-abcdefgh";
+    const std::string write_token = "write-token-for-test-0123456789-abcdefg";
+    const std::string monitor_token = "monitor-token-test-0123456789-abcdef";
+    const std::string scoped_token = "scoped-token-for-test-0123456789-abcdef";
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("kvstore-grpc-auth-" + std::to_string(getpid()));
+    std::filesystem::create_directories(directory);
+    const auto auth_path = directory / "authorization.conf";
+    const auto token_path = directory / "node-token";
+    {
+        std::ofstream auth(auth_path);
+        auth << Sha256HexForTest(read_token) << "=read\n"
+             << Sha256HexForTest(write_token) << "=write\n"
+             << Sha256HexForTest(monitor_token) << "=monitor\n"
+             << Sha256HexForTest(scoped_token)
+             << "=read,write;read_prefixes=tenant/alice/;write_prefixes=tenant/alice/\n";
+        std::ofstream node_token(token_path);
+        node_token << monitor_token << '\n';
+    }
+    ASSERT_EQ(chmod(auth_path.c_str(), 0600), 0);
+    ASSERT_EQ(chmod(token_path.c_str(), 0600), 0);
+
+    TestServer server("18100", true, {
+        "--auth-file", auth_path.string(),
+        "--token-file", token_path.string(),
+    });
+    ASSERT_GT(server.pid, 0);
+
+    const auto address = "localhost:" + server.port;
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub stub(channel);
+    auto call_status = [&](const std::string& token) {
+        grpc::ClientContext context;
+        if (!token.empty()) {
+            context.AddMetadata("authorization", "Bearer " + token);
+        }
+        kvstore::ClusterStatusRequest request;
+        kvstore::ClusterStatusResponse response;
+        return stub.GetClusterStatus(&context, request, &response);
+    };
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    grpc::Status monitor_status;
+    while (std::chrono::steady_clock::now() < deadline) {
+        monitor_status = call_status(monitor_token);
+        if (monitor_status.ok()) {
+            kvstore::ClusterStatusRequest request;
+            kvstore::ClusterStatusResponse response;
+            grpc::ClientContext context;
+            context.AddMetadata("authorization", "Bearer " + monitor_token);
+            if (stub.GetClusterStatus(&context, request, &response).ok() && response.is_leader()) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_TRUE(monitor_status.ok());
+
+    EXPECT_EQ(call_status("").error_code(), grpc::StatusCode::UNAUTHENTICATED);
+    EXPECT_EQ(call_status("unknown-token-value-0123456789-abcdefgh").error_code(),
+              grpc::StatusCode::UNAUTHENTICATED);
+    EXPECT_EQ(call_status(read_token).error_code(), grpc::StatusCode::PERMISSION_DENIED);
+
+    kvstore::GetRequest get_request;
+    get_request.set_key("rbac-key");
+    kvstore::GetResponse get_response;
+    grpc::ClientContext read_context;
+    read_context.AddMetadata("authorization", "Bearer " + read_token);
+    EXPECT_TRUE(stub.Get(&read_context, get_request, &get_response).ok());
+    EXPECT_FALSE(get_response.found());
+
+    kvstore::SetRequest set_request;
+    set_request.set_key("rbac-key");
+    set_request.set_value("value");
+    kvstore::SetResponse set_response;
+    grpc::ClientContext denied_write_context;
+    denied_write_context.AddMetadata("authorization", "Bearer " + read_token);
+    EXPECT_EQ(stub.Set(&denied_write_context, set_request, &set_response).error_code(),
+              grpc::StatusCode::PERMISSION_DENIED);
+
+    grpc::ClientContext write_context;
+    write_context.AddMetadata("authorization", "Bearer " + write_token);
+    ASSERT_TRUE(stub.Set(&write_context, set_request, &set_response).ok());
+    ASSERT_TRUE(set_response.success());
+
+    kvstore::GetResponse denied_get_response;
+    grpc::ClientContext denied_read_context;
+    denied_read_context.AddMetadata("authorization", "Bearer " + write_token);
+    EXPECT_EQ(stub.Get(&denied_read_context, get_request, &denied_get_response).error_code(),
+              grpc::StatusCode::PERMISSION_DENIED);
+
+    kvstore::SetRequest scoped_set_request;
+    scoped_set_request.set_key("tenant/alice/item");
+    scoped_set_request.set_value("scoped");
+    kvstore::SetResponse scoped_set_response;
+    grpc::ClientContext scoped_set_context;
+    scoped_set_context.AddMetadata("authorization", "Bearer " + scoped_token);
+    ASSERT_TRUE(stub.Set(&scoped_set_context, scoped_set_request, &scoped_set_response).ok());
+    ASSERT_TRUE(scoped_set_response.success());
+
+    kvstore::SetRequest out_of_scope_request;
+    out_of_scope_request.set_key("tenant/bob/item");
+    out_of_scope_request.set_value("denied");
+    kvstore::SetResponse out_of_scope_response;
+    grpc::ClientContext out_of_scope_context;
+    out_of_scope_context.AddMetadata("authorization", "Bearer " + scoped_token);
+    EXPECT_EQ(stub.Set(&out_of_scope_context, out_of_scope_request, &out_of_scope_response).error_code(),
+              grpc::StatusCode::PERMISSION_DENIED);
+
+    kvstore::ListKeysRequest list_request;
+    kvstore::ListKeysResponse list_response;
+    grpc::ClientContext list_context;
+    list_context.AddMetadata("authorization", "Bearer " + scoped_token);
+    ASSERT_TRUE(stub.ListKeys(&list_context, list_request, &list_response).ok());
+    ASSERT_EQ(list_response.keys_size(), 1);
+    EXPECT_EQ(list_response.keys(0), "tenant/alice/item");
+
+    {
+        std::ofstream auth(auth_path, std::ios::trunc);
+        auth << "malformed=read\n";
+    }
+    ASSERT_EQ(kill(server.pid, SIGHUP), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_TRUE(call_status(monitor_token).ok());
+
+    {
+        std::ofstream auth(auth_path, std::ios::trunc);
+        auth << Sha256HexForTest(scoped_token)
+             << "=read,write;read_prefixes=tenant/alice/;write_prefixes=tenant/alice/\n";
+    }
+    ASSERT_EQ(kill(server.pid, SIGHUP), 0);
+    grpc::Status revoked_status;
+    const auto reload_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        revoked_status = call_status(monitor_token);
+        if (revoked_status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < reload_deadline);
+    EXPECT_EQ(revoked_status.error_code(), grpc::StatusCode::UNAUTHENTICATED);
+
+    StopServer(server.pid);
+    server.pid = -1;
+    std::error_code remove_error;
+    std::filesystem::remove_all(directory, remove_error);
+    EXPECT_FALSE(remove_error);
+}
+
+TEST(RaftIntegration, RejectsOversizedGrpcMessages) {
+    TestServer server("18101");
+    ASSERT_GT(server.pid, 0);
+    ASSERT_TRUE(WaitForServer("localhost:" + server.port));
+
+    grpc::ChannelArguments arguments;
+    arguments.SetMaxSendMessageSize(20 * 1024 * 1024);
+    auto channel = grpc::CreateCustomChannel(
+        "localhost:" + server.port, grpc::InsecureChannelCredentials(), arguments);
+    kvstore::KVStore::Stub stub(channel);
+    kvstore::InstallSnapshotRequest request;
+    request.set_leader_term(1);
+    request.set_leader_id(std::stoi(server.port));
+    request.set_last_included_index(1);
+    request.set_last_included_term(1);
+    request.set_snapshot_data(std::string(17 * 1024 * 1024, 'x'));
+    kvstore::InstallSnapshotResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+    EXPECT_EQ(stub.InstallSnapshot(&context, request, &response).error_code(),
+              grpc::StatusCode::RESOURCE_EXHAUSTED);
 }
 
 TEST(RaftIntegration, LeaderCommitsNoOpBeforeReportingReadiness) {
@@ -689,6 +882,104 @@ TEST(RaftIntegration, LeaderStepsDownWhenItLosesQuorum) {
             waitpid(pid, nullptr, 0);
         }
     }
+}
+
+TEST(RaftIntegration, PausedLeaderFailsOverAndCatchesUpAfterResume) {
+    const std::vector<std::string> ports = {"18110", "18111", "18112"};
+    TestCluster cluster(ports);
+    for (const auto& port : ports) {
+        ASSERT_TRUE(WaitForServer("localhost:" + port));
+    }
+
+    std::size_t old_leader_index = ports.size();
+    const auto election_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < election_deadline &&
+           old_leader_index == ports.size()) {
+        for (std::size_t index = 0; index < ports.size(); ++index) {
+            auto channel = grpc::CreateChannel(
+                "localhost:" + ports[index], grpc::InsecureChannelCredentials());
+            kvstore::KVStore::Stub stub(channel);
+            kvstore::ClusterStatusRequest request;
+            kvstore::ClusterStatusResponse response;
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() +
+                                 std::chrono::seconds(1));
+            if (stub.GetClusterStatus(&context, request, &response).ok() &&
+                response.is_leader()) {
+                old_leader_index = index;
+                break;
+            }
+        }
+        if (old_leader_index == ports.size())
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_LT(old_leader_index, ports.size());
+    ASSERT_EQ(kill(cluster.pids[old_leader_index], SIGSTOP), 0);
+
+    std::string replacement_leader;
+    const auto failover_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < failover_deadline &&
+           replacement_leader.empty()) {
+        for (std::size_t index = 0; index < ports.size(); ++index) {
+            if (index == old_leader_index)
+                continue;
+            const auto address = "localhost:" + ports[index];
+            auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+            kvstore::KVStore::Stub stub(channel);
+            kvstore::ClusterStatusRequest request;
+            kvstore::ClusterStatusResponse response;
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() +
+                                 std::chrono::seconds(1));
+            if (stub.GetClusterStatus(&context, request, &response).ok() &&
+                response.is_leader()) {
+                replacement_leader = address;
+                break;
+            }
+        }
+        if (replacement_leader.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_FALSE(replacement_leader.empty());
+
+    auto leader_channel = grpc::CreateChannel(
+        replacement_leader, grpc::InsecureChannelCredentials());
+    kvstore::KVStore::Stub leader_stub(leader_channel);
+    kvstore::SetRequest write_request;
+    write_request.set_key("paused-leader-recovery");
+    write_request.set_value("committed-with-majority");
+    kvstore::SetResponse write_response;
+    grpc::ClientContext write_context;
+    write_context.set_deadline(std::chrono::system_clock::now() +
+                               std::chrono::seconds(5));
+    ASSERT_TRUE(leader_stub.Set(&write_context, write_request, &write_response).ok());
+    ASSERT_TRUE(write_response.success());
+
+    ASSERT_EQ(kill(cluster.pids[old_leader_index], SIGCONT), 0);
+    const auto recovery_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(15);
+    bool recovered = false;
+    while (std::chrono::steady_clock::now() < recovery_deadline) {
+        auto channel = grpc::CreateChannel(
+            "localhost:" + ports[old_leader_index], grpc::InsecureChannelCredentials());
+        kvstore::KVStore::Stub stub(channel);
+        kvstore::GetRequest get_request;
+        get_request.set_key("paused-leader-recovery");
+        kvstore::GetResponse get_response;
+        grpc::ClientContext get_context;
+        get_context.set_deadline(std::chrono::system_clock::now() +
+                                 std::chrono::seconds(1));
+        if (stub.Get(&get_context, get_request, &get_response).ok() &&
+            get_response.found() &&
+            get_response.value() == "committed-with-majority") {
+            recovered = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_TRUE(recovered);
 }
 
 TEST(RaftIntegration, EmptyAppendEntriesPreservesMatchingSuffix) {

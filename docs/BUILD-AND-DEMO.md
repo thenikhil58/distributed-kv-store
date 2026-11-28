@@ -7,6 +7,7 @@ automated test instructions, and the dashboard workflow, see [the testing guide]
 
 - Windows 10/11
 - [Git](https://git-scm.com/)
+- OpenSSL development files, in addition to gRPC, Protobuf, and GoogleTest
 - ~5 GB of free disk space (for the compiler toolchain and gRPC dependencies)
 
 > **Platform status:** The server's persistence code currently uses POSIX APIs
@@ -96,30 +97,30 @@ Open three separate terminals and start one node in each. All nodes start symmet
 
 ```powershell
 # Terminal 1
-.\build\Debug\server.exe 50051 50052 50053
+.\build\Debug\server.exe 50051 50052 50053 --insecure-dev
 
 # Terminal 2
-.\build\Debug\server.exe 50052 50051 50053
+.\build\Debug\server.exe 50052 50051 50053 --insecure-dev
 
 # Terminal 3
-.\build\Debug\server.exe 50053 50051 50052
+.\build\Debug\server.exe 50053 50051 50052 --insecure-dev
 ```
 
-Within a few seconds, one node will log `*** BECAME LEADER ***`.
+Within a few seconds, one node will emit a JSON `raft_leader_elected` event.
 
 ## 8. Talk to the Cluster
 
 In a fourth terminal:
 
 ```powershell
-.\build\Debug\client.exe
+.\build\Debug\client.exe --insecure-dev
 ```
 
 The client accepts an address with `--address`; it can connect to any node and follow leader hints.
 For example:
 
 ```powershell
-.\build\Debug\client.exe --address localhost:50052
+.\build\Debug\client.exe --address localhost:50052 --insecure-dev
 ```
 
 ## 9. Run the Chaos Test (Optional)
@@ -135,18 +136,25 @@ This starts a fresh 3-node cluster and repeatedly kills/restarts a random node, 
 Nodes persist Raft data under `data\node_<port>\`. The WAL is replayed on startup and
 committed state is periodically compacted into a snapshot.
 
-Enable mutual TLS by passing the CA, certificate, and private key to each server and
-the client:
+For the local-only demo, each server must explicitly use `--insecure-dev` as shown
+above. This allows plaintext gRPC only on loopback. Normal server/client startup
+requires mTLS and role authorization; omission of credentials is a startup error.
+See the [security setup and credential lifecycle guide](SECURITY.md) for private
+certificate/token provisioning, server configuration, rotation, and revocation.
+
+For a secured deployment, configure each node with an authorization file, its private
+node-token file, and all three TLS files. A secure server command resembles:
 
 ```powershell
-.\build\Debug\server.exe 50051 50052 50053 --ca ca.pem --cert node-50051.pem --key node-50051-key.pem
-.\build\Debug\client.exe --address localhost:50051 --ca ca.pem --cert client.pem --key client-key.pem
+.\build\Debug\server.exe 50051 50052 50053 --bind 10.0.0.11 --ca ca.pem --cert node-50051.pem --key node-50051-key.pem --auth-file tokens.conf --token-file node.token
+.\build\Debug\client.exe --address node-1.internal:50051 --ca ca.pem --cert client.pem --key client-key.pem --token-file client.token
 ```
 
-The server requires all three TLS options together. If any TLS option is supplied without
-the other two, startup fails instead of silently falling back to plaintext. If none are
-supplied, gRPC remains unauthenticated and unencrypted; keep that mode on a trusted local
-network only.
+The node listener defaults to `127.0.0.1`; use a private interface address only when
+cluster peers need remote access. The TLS SAN must match each address clients use.
+The token authorization file contains token hashes, role names, and optional key-prefix
+scopes; never commit token files or private keys. See [the security guide](SECURITY.md)
+for SIGHUP reload, CRLs, scoped-token syntax, and the credential rotation helper.
 
 Outbound peer endpoints can be reloaded without restarting a node. Pass `--peers-file` and keep one
 `host:port` endpoint per line; editing the file updates the peer stubs. This is not Raft joint
@@ -162,14 +170,15 @@ existing gRPC API. Install its dependencies and run it alongside the static web 
 python -m pip install -r requirements.txt
 
 # Terminal 1: gateway to the C++ node
-python gateway.py --target localhost:50051 --port 8080
+python gateway.py --target localhost:50051 --port 8080 --insecure-dev
 
 # Terminal 2: browser UI
 python -m http.server 4173 --directory web
 ```
 
-Open `http://localhost:4173`. For a TLS-enabled node, add `--ca`, `--cert`, and `--key`
-to the gateway command. The dashboard now reports gateway health and sends CRUD mutations
+Open `http://localhost:4173`. For a secured deployment, provide the gateway's client
+certificate, key, CA, and `--token-file`; bind outside loopback only behind HTTPS with
+dashboard authentication and network restrictions. The dashboard now reports gateway health and sends CRUD mutations
 to the Raft service instead of keeping them only in browser memory.
 
 ## Troubleshooting

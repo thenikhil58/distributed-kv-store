@@ -38,12 +38,24 @@ void Assign(RuntimeConfig &config, const std::string &key, const std::string &va
 {
     if (key == "port")
         config.port = value;
+    else if (key == "bind")
+        config.bind = value;
+    else if (key == "metrics_port")
+        config.metrics_port = value;
+    else if (key == "metrics_bind")
+        config.metrics_bind = value;
     else if (key == "peers")
         config.peers = SplitPeers(value);
     else if (key == "data_root")
         config.data_root = value;
     else if (key == "peers_file")
         config.peers_file = value;
+    else if (key == "auth_file")
+        config.auth_file = value;
+    else if (key == "token_file")
+        config.token_file = value;
+    else if (key == "crl_directory")
+        config.crl_directory = value;
     else if (key == "ca")
         config.ca_file = value;
     else if (key == "cert")
@@ -99,6 +111,21 @@ void ValidateRuntimeConfig(const RuntimeConfig &config)
                               !config.private_key_file.empty();
     if (any_tls && !complete_tls)
         throw std::runtime_error("ca, cert, and key must be configured together");
+    if (!complete_tls && !config.crl_directory.empty())
+        throw std::runtime_error("crl_directory requires TLS credentials");
+
+    if (config.bind.empty())
+        throw std::runtime_error("bind address must not be empty");
+    if (!config.metrics_port.empty())
+    {
+        const int metrics_port = ParsePort(config.metrics_port, "metrics");
+        if (config.metrics_bind.empty())
+            throw std::runtime_error("metrics_bind must not be empty");
+        if (metrics_port == node_port || peer_ports.count(metrics_port))
+            throw std::runtime_error("metrics port must not collide with a configured gRPC node port");
+    }
+    if (config.auth_file.empty() != config.token_file.empty())
+        throw std::runtime_error("auth_file and token_file must be configured together");
 }
 
 RuntimeConfig LoadRuntimeConfig(const std::filesystem::path &path)

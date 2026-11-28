@@ -22,7 +22,7 @@ On Ubuntu/Debian, the package names are commonly:
 sudo apt update
 sudo apt install -y build-essential cmake pkg-config \
   libgrpc++-dev libprotobuf-dev protobuf-compiler \
-  protobuf-compiler-grpc libgtest-dev python3 python3-pip curl
+  protobuf-compiler-grpc libgtest-dev libssl-dev python3 python3-pip curl
 ```
 
 If the machine uses vcpkg, configure CMake with the vcpkg toolchain file instead of installing the C++ dependencies from the OS packages.
@@ -103,7 +103,8 @@ The C++ suite currently includes:
 - `runtime_config_tests`: configuration parsing, invalid values, comments, and TLS validation
 - `raft_tests`: multi-node startup, leader election, replication, persistence, failover,
   follower forwarding, malformed Raft metadata rejection, corrupt snapshot startup
-  rejection, truncated WAL-tail recovery, and repeated acknowledged-write restarts
+  rejection, truncated WAL-tail recovery, token-scope/revocation behavior, and a
+  paused-leader failover/rejoin scenario
 
 Run one test target directly when debugging:
 
@@ -120,15 +121,42 @@ ctest --test-dir build -V
 
 The integration tests start temporary server processes and use test ports. The cleanup command above prevents old WAL/snapshot state from affecting the persistence and follower-forwarding tests. Stop any manually started test cluster before rerunning tests if a port is reported as busy.
 
-Run the gateway's account-isolation, backup/restore, rate-limit, and topology tests with:
+run the gateway's account-isolation, backup/restore, rate-limit, topology, live token-file,
+credential-bundle rotation, and revoked-client-certificate tests with:
 
 ```bash
-python3 -m unittest tests/test_gateway.py -v
+python3 -m unittest tests/test_gateway.py tests/test_credential_rotation.py tests/test_tls_crl.py -v
 ```
 
-CI runs the C++ build/tests and sanitizer configurations. Run the Python gateway tests locally as
-shown above; they are a separate suite. A passing test run is not a production-readiness guarantee;
-see [the production readiness notes](PRODUCTION-READINESS.md) for required operational and failure testing.
+CI runs the C++ build/tests, Python tests and bytecode compilation, ASan/UBSan,
+Python dependency audit, and macOS build/test. A local TSan build is available through
+`-DENABLE_TSAN=ON`, but distro gRPC/Abseil libraries are not instrumented and report
+races in their own internals. TSan also found an application race in cluster-status
+reads, which has been fixed; the overall run is not clean and should not be treated as
+a clean project result. To build gRPC and its bundled Abseil, protobuf, and supporting
+dependencies with TSan, clone gRPC v1.51.1 with submodules initialized, then configure
+the project with `-DENABLE_TSAN=ON` and
+`-DKVSTORE_TSAN_GRPC_SOURCE_DIR=/path/to/grpc`. The CMake option requires an explicit
+v1.51.1 source checkout; normal configuration does not fetch dependencies. The checkout
+must include its Abseil, protobuf, re2, c-ares, and zlib submodules. For example:
+
+```bash
+git clone --depth 1 --branch v1.51.1 --recurse-submodules \
+  https://github.com/grpc/grpc.git /tmp/grpc-tsan
+cmake -S . -B build-tsan-instrumented -DENABLE_TSAN=ON \
+  -DKVSTORE_TSAN_GRPC_SOURCE_DIR=/tmp/grpc-tsan
+cmake --build build-tsan-instrumented --parallel
+setarch "$(uname -m)" -R ctest --test-dir build-tsan-instrumented --output-on-failure
+```
+
+Record the resolved gRPC commit and archive the complete TSan output. A clean run is not
+established until this configuration completes and the reports are reviewed.
+
+A full C++ integration run takes several minutes because it launches and gracefully
+stops many local Raft processes.
+A passing test run is not a production-readiness guarantee; see [the production
+readiness notes](PRODUCTION-READINESS.md) and [release process](RELEASE-PROCESS.md)
+for operational and external qualification gates.
 
 ## 6. Run a Manual Three-Node Cluster
 
@@ -137,32 +165,32 @@ Open three terminals from the project root.
 Terminal 1:
 
 ```bash
-./build/server 50051 50052 50053
+./build/server 50051 50052 50053 --insecure-dev
 ```
 
 Terminal 2:
 
 ```bash
-./build/server 50052 50051 50053
+./build/server 50052 50051 50053 --insecure-dev
 ```
 
 Terminal 3:
 
 ```bash
-./build/server 50053 50051 50052
+./build/server 50053 50051 50052 --insecure-dev
 ```
 
 Wait until one node reports:
 
 ```text
-*** BECAME LEADER ***
+{"event":"raft_leader_elected"}
 ```
 
 The nodes persist state under `data/node_<port>/`. For a disposable manual run, use a separate data root:
 
 ```bash
 rm -rf /tmp/kvstore-manual
-./build/server 50051 50052 50053 --data-root /tmp/kvstore-manual
+./build/server 50051 50052 50053 --data-root /tmp/kvstore-manual --insecure-dev
 ```
 
 ## 7. Run the Complete Dashboard Stack
@@ -300,13 +328,27 @@ curl -i -X DELETE 'http://127.0.0.1:8080/api/entry?key=hello'
 Build benchmarks with `-DBUILD_BENCHMARKS=ON`, then run the benchmark against a running node:
 
 ```bash
-./build/kvstore_benchmark localhost:50051 1000
+./build/kvstore_benchmark localhost:50051 1000 --insecure-dev \
+  --mode mixed --workers 8 --cluster-size 3 --value-bytes 256
 ```
 
-The benchmark prints sequential write throughput and operation latency percentiles.
-Record the result with the commit, build type, cluster size, hardware, storage, network,
-and run conditions. These measurements are not an established capacity or latency
-guarantee.
+Modes are `set`, `get`, or `mixed`; GET mode creates its sample keys before timing.
+The benchmark prints one JSON record with throughput and p50/p95/p99/max operation
+latency. `--cluster-size` is an operator-supplied label, not auto-detected topology.
+
+Run repeated worker/value/mode combinations and capture optional node CPU, RSS, and
+storage metrics as JSONL:
+
+```bash
+python3 benchmarks/run_matrix.py --target localhost:50051 --cluster-size 3 \
+  --operations 1000 --workers 1 4 16 --value-bytes 16 1024 \
+  --runs 3 --insecure-dev --output benchmark-results.jsonl
+```
+
+Keep the exact commit, build type, cluster size, hardware, storage, network, and run
+conditions with results. These measurements do not establish a capacity or latency
+guarantee. Add `--metrics-url` when the selected node is configured with its optional
+metrics listener to capture resource and storage snapshots.
 
 The first argument is the gRPC address and the second is the number of operations.
 
@@ -362,7 +404,7 @@ https://<forwarded-dashboard-host>/?api=https://<forwarded-gateway-host>
 Start the gateway with the dashboard origin explicitly allowed:
 
 ```bash
-python3 gateway.py --target localhost:50051 --port 8080 --allowed-origin https://<forwarded-dashboard-host>
+python3 gateway.py --target localhost:50051 --port 8080 --allowed-origin https://<forwarded-dashboard-host> --insecure-dev
 ```
 
 The gateway must be forwarded publicly or privately according to the environment's security settings. Do not expose a development gateway publicly without authentication or network restrictions.
@@ -383,6 +425,11 @@ To start the default stack again:
 ./start.sh
 ```
 
+`start.sh` is a loopback-only plaintext development demo. Normal server, client, and
+gateway invocations require mTLS and gRPC role tokens; use the [security guide](SECURITY.md)
+for provisioning and lifecycle instructions. The `--insecure-dev` flag must never be
+used for remotely reachable addresses.
+
 ## 13. Troubleshooting
 
 ### Gateway offline in the dashboard
@@ -396,7 +443,7 @@ curl -i http://127.0.0.1:8080/api/health
 If it is not reachable, start it manually on the loopback interface:
 
 ```bash
-python3 gateway.py --host 127.0.0.1 --target localhost:50051 --port 8080
+python3 gateway.py --host 127.0.0.1 --target localhost:50051 --port 8080 --insecure-dev
 ```
 
 For trusted private-network exposure, add `--allow-public` and a users file or `GATEWAY_ALLOW_PUBLIC=1` plus `GATEWAY_SESSION_SECRET` with `USERS_FILE`.

@@ -91,6 +91,7 @@ changing runtime versions; an on-disk rolling upgrade procedure is not currently
 
 Membership is configured statically at startup. A watched peer file can rebuild outbound
 connections, but this is **not** Raft joint consensus and must not be used to change the voting
-membership of a running cluster. Direct gRPC access is unauthenticated unless mutual TLS is
-configured; dashboard login only protects the HTTP gateway. See the
-[production readiness notes](PRODUCTION-READINESS.md).
+membership of a running cluster. Normal gRPC operation requires mutual TLS and a bearer
+token with a method-specific role; `--insecure-dev` is reserved for loopback development.
+Dashboard login only protects the HTTP gateway. See the
+[security guide](SECURITY.md) and [production readiness notes](PRODUCTION-READINESS.md).
