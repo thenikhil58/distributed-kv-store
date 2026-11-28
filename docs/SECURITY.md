@@ -6,11 +6,16 @@ plaintext or missing authorization credentials. `--insecure-dev` is an explicit
 loopback-only exception used by `start.sh` and local tests; never use it for a remote
 node or gateway.
 
-This is not a production security certification. The gRPC token file is read at
-startup; token revocation requires a restart. Certificate revocation lists, automated
-rotation, per-key gRPC ACLs, a global gRPC connection count, and a separately privileged
-backup RPC are not implemented. Direct `read`/`write` roles can access the whole keyspace.
-Per-account key isolation exists only at the authenticated dashboard gateway.
+This is not a production security certification. A server reloads token policy on
+SIGHUP, and optional gRPC CRL directories are supported by the C++ server and clients.
+The Python gateway's gRPC API does not expose CRL configuration: server-side CRLs still
+reject revoked gateway/client certificates, but the gateway cannot independently reject
+a revoked node certificate via CRL. Use CA rotation to remove trust in a revoked node
+certificate from that gateway. The rotation helper stages and atomically activates
+credential bundles, but an operator must verify every node and gateway after reload.
+Per-key gRPC scopes are optional; tokens without an explicit scope retain the legacy
+role-wide keyspace access. A global gRPC connection count and separately privileged
+backup RPC are not implemented.
 
 ## Trust and role model
 
@@ -30,6 +35,20 @@ Use a node token with only `node,monitor`. A client should receive only the data
 monitor roles it needs. A gateway token needs `read,write,monitor` for dashboard CRUD,
 backup/restore, and cluster status. Gateway account sessions further isolate dashboard
 keys by username; do not expose the gateway's gRPC token to browser code.
+
+An authorization-file line may include optional byte-prefix scopes:
+
+```text
+<lowercase-sha256>=read,write;read_prefixes=tenant/alice/;write_prefixes=tenant/alice/
+```
+
+`Get` and `ListKeys` enforce `read_prefixes`; `Set` and `Delete` enforce
+`write_prefixes`. Prefixes are literal byte prefixes, not path globs. Use a delimiter
+such as `/` to avoid accidental namespace overlap. A scope may contain comma-separated
+prefixes; use `*` alone for unrestricted access. Omitting a scope preserves the older
+role-wide behavior. Prefixes containing commas or semicolons, or leading/trailing
+whitespace, cannot be represented in this file format. Node and monitor roles do not
+accept key scopes.
 
 Forwarded client RPCs preserve the original bearer token. A node token alone cannot
 read or change keys. Node peers are still a trusted Raft security boundary: any
@@ -139,24 +158,61 @@ an approved dashboard origin. The local demo launcher intentionally uses
 
 ## Rotation, expiry, revocation, and incident response
 
-- **Routine token rotation:** provision a new random token and add its digest to every
-  server authorization file; install the new raw token only on its intended workload.
-  Restart the cluster in a maintenance window so all nodes load the same authorization
-  file, update clients/gateway, verify each role, then remove the old digest and restart
-  again. Do not assume authorization-file edits take effect live.
+- **Stage a credential bundle:** create a new sibling directory containing `ca.pem`,
+  `cert.pem`, `key.pem`, `auth.conf`, `node.token`, and `crls/`. Keep the directory
+  private (mode `0700`), and keep `key.pem`, `auth.conf`, and `node.token` at mode
+  `0600` or stricter. Point each node's TLS, auth, token, and CRL config paths through
+  one stable symlink such as `/etc/raft-kv/credentials/current/`. Use node-specific
+  bundles where identities or node tokens differ.
+- **Activate a staged node bundle:** after reviewing the new certificate SAN/EKU,
+  token digests/roles, and CRLs, run the rotation helper once per host with every local
+  server PID:
+
+  ```bash
+  rotate_credentials.py \
+    --current-link /etc/raft-kv/credentials/current \
+    --new-directory /etc/raft-kv/credentials/version-2026-11 \
+    --pid "$(pgrep -x server)"
+  ```
+
+  For multiple nodes, execute on each host with its local server PID. The helper checks
+  bundle permissions, atomically switches the symlink, and sends SIGHUP. The server
+  reloads token roles/node tokens; its gRPC file watcher reloads CA/certificate/key
+  files. Confirm server logs contain `security_credentials_reloaded` on every node and
+  test the new credentials before removing old trust. A failed reload is logged and
+  retains the previous in-memory token policy. The helper cannot prove successful
+  authentication or roll back a partially applied multi-host rotation.
+- **Routine token rotation:** keep both old and new token hashes valid during the
+  overlap. Install the new token file for its intended workload, activate/reload the
+  server policy, verify access and role boundaries, then remove the old digest and
+  reload all servers again. The C++ client and gateway read the token file for each
+  call; restart the gateway to reload its TLS certificate/key. Do not revoke the old
+  token until every caller has switched.
 - **Certificate rotation under the same CA:** issue replacement certificates before
-  expiry, verify SAN and EKU, deploy the new key/certificate, restart each node/client
-  in a controlled maintenance window, and verify mTLS connectivity before removing old
-  files. Monitor certificate expiration externally; the project has no expiry alert.
+  expiry, verify SAN/EKU, stage the matching key/certificate in the credential bundle,
+  and switch/reload one node at a time. Monitor certificate expiration externally; the
+  project has no expiry alert. The gateway must be restarted to load changed TLS files.
 - **CA rotation:** distribute a CA bundle containing both old and new public CA
   certificates to every node/client and restart; issue/deploy new leaf certificates;
   verify all peers; then remove the old CA and restart again. Keep the old CA private
   key offline and destroy it according to the organization's key policy.
-- **Revocation:** there is no CRL or OCSP integration. Revoke a token by deleting its
-  digest and restarting every server; revoke a certificate by removing trust in its CA
-  and replacing the affected certificate. If the CA private key is compromised, stop
-  the cluster, create a new CA, reissue all certificates, rotate every token, and restore
-  service only after the new trust configuration is verified.
+- **Certificate revocation:** CRLs are optional and configured with
+  `crl_directory = /etc/raft-kv/credentials/current/crls` (or
+  `--crl-directory`). The gRPC implementation requires an OpenSSL-backed build and
+  hashed X.509 CRL files in the directory (prepare the CRL using the CA's protected
+  issuance process, then run `openssl rehash <crl-directory>`). Revocation is not
+  effective until every relevant server/client has loaded the updated CRL; restart
+  those processes after changing CRL files. C++ clients and benchmarks can use
+  `--crl-directory`; the Python gateway does not currently have a corresponding
+  grpcio API option. Its mTLS client certificate is still checked against each node's
+  CRL. To revoke a node server certificate for a gateway, rotate the trusted CA bundle.
+  The CRL option is experimental in gRPC and is not a substitute for an independently
+  reviewed PKI process. OCSP is not supported.
+- **Token revocation:** remove the digest from the authorization file and send SIGHUP
+  to every server, or activate a staged bundle with the rotation helper. Verify the
+  revoked token fails on every node. If the CA private key is compromised, isolate
+  affected processes, replace the CA, reissue all certificates, rotate every token,
+  and restore service only after the new trust configuration is verified.
 - **Emergency replacement:** isolate affected workloads and block their network access
   immediately. Preserve incident evidence without copying raw credentials into logs or
   tickets. For a leaked node token or CA key, stop affected nodes, replace credentials

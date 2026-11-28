@@ -54,6 +54,8 @@ void Assign(RuntimeConfig &config, const std::string &key, const std::string &va
         config.auth_file = value;
     else if (key == "token_file")
         config.token_file = value;
+    else if (key == "crl_directory")
+        config.crl_directory = value;
     else if (key == "ca")
         config.ca_file = value;
     else if (key == "cert")
@@ -109,6 +111,8 @@ void ValidateRuntimeConfig(const RuntimeConfig &config)
                               !config.private_key_file.empty();
     if (any_tls && !complete_tls)
         throw std::runtime_error("ca, cert, and key must be configured together");
+    if (!complete_tls && !config.crl_directory.empty())
+        throw std::runtime_error("crl_directory requires TLS credentials");
 
     if (config.bind.empty())
         throw std::runtime_error("bind address must not be empty");

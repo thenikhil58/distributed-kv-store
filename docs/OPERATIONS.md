@@ -157,7 +157,8 @@ cmake --install build --prefix "$PWD/stage"
 cmake --build build --target package
 ```
 
-The package contains the server, C++ client, optional benchmark, and example config;
+The package contains the server, C++ client, optional benchmark, credential rotation
+helper, and example config;
 it does not include credentials, a data root, or bundled operating-system libraries.
 
 Keep config examples node-specific and protected. Verify file permissions, bind

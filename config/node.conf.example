@@ -11,5 +11,6 @@ data_root = data
 # ca = /etc/raft-kv/pki/ca-bundle.pem
 # cert = /etc/raft-kv/pki/node-50051.pem
 # key = /etc/raft-kv/pki/node-50051-key.pem
+# crl_directory = /etc/raft-kv/pki/crls
 # auth_file = /etc/raft-kv/auth/tokens.conf
 # token_file = /etc/raft-kv/auth/node.token

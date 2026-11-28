@@ -171,6 +171,16 @@ def read_secret(path):
     return token
 
 
+def file_token_call_credentials(path):
+    def provide_token(context, callback):
+        try:
+            callback((("authorization", f"Bearer {read_secret(path)}"),), None)
+        except (OSError, ValueError) as error:
+            callback((), error)
+
+    return grpc.metadata_call_credentials(provide_token)
+
+
 def is_loopback_target(target):
     host = target.rsplit(":", 1)[0].strip("[]").lower()
     return host in {"localhost", "127.0.0.1", "::1"}
@@ -843,8 +853,8 @@ def main():
                 certificate_chain=read_text(args.cert).encode(),
                 private_key=read_text(args.key).encode(),
             )
-            token = read_secret(args.token_file)
-            call_credentials = grpc.access_token_call_credentials(token)
+            read_secret(args.token_file)
+            call_credentials = file_token_call_credentials(args.token_file)
             credentials = grpc.composite_channel_credentials(credentials, call_credentials)
             channel = grpc.secure_channel(args.target, credentials)
         else:

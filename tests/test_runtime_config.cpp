@@ -22,7 +22,8 @@ TEST(RuntimeConfig, ParsesValuesAndPeerLists)
                << "metrics_bind = 127.0.0.1\n"
                << "ca = ca.pem\n"
                << "cert = node.pem\n"
-               << "key = node.key\n";
+               << "key = node.key\n"
+               << "crl_directory = crls\n";
     }
 
     const auto config = LoadRuntimeConfig(path);
@@ -40,6 +41,7 @@ TEST(RuntimeConfig, ParsesValuesAndPeerLists)
     EXPECT_EQ(config.ca_file, "ca.pem");
     EXPECT_EQ(config.certificate_file, "node.pem");
     EXPECT_EQ(config.private_key_file, "node.key");
+    EXPECT_EQ(config.crl_directory, "crls");
     std::filesystem::remove(path);
 }
 
@@ -103,6 +105,21 @@ TEST(RuntimeConfig, RejectsPartialAuthorizationConfiguration)
 {
     RuntimeConfig config;
     config.auth_file = "auth.conf";
+    EXPECT_THROW(ValidateRuntimeConfig(config), std::runtime_error);
+}
+
+TEST(RuntimeConfig, RequiresCrlDirectoryWithTlsCredentials)
+{
+    RuntimeConfig config;
+    config.ca_file = "ca.pem";
+    config.certificate_file = "node.pem";
+    config.private_key_file = "node.key";
+    EXPECT_NO_THROW(ValidateRuntimeConfig(config));
+    config.crl_directory = "crls";
+    EXPECT_NO_THROW(ValidateRuntimeConfig(config));
+    config.ca_file.clear();
+    config.certificate_file.clear();
+    config.private_key_file.clear();
     EXPECT_THROW(ValidateRuntimeConfig(config), std::runtime_error);
 }
 

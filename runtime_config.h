@@ -14,6 +14,7 @@ struct RuntimeConfig {
     std::filesystem::path peers_file;
     std::filesystem::path auth_file;
     std::filesystem::path token_file;
+    std::filesystem::path crl_directory;
     std::string ca_file;
     std::string certificate_file;
     std::string private_key_file;

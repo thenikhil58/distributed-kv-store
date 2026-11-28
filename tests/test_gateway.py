@@ -126,6 +126,27 @@ class GatewayHttpTests(unittest.TestCase):
             os.chmod(path, 0o600)
             self.assertIn("alice", gateway.load_users(path))
 
+    def test_file_token_call_credentials_read_rotated_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = gateway.Path(directory) / "token"
+            path.write_text("first-token-value-with-more-than-32-bytes", encoding="utf-8")
+            os.chmod(path, 0o600)
+            captured = {}
+            with patch.object(gateway.grpc, "metadata_call_credentials",
+                              side_effect=lambda callback: callback):
+                provider = gateway.file_token_call_credentials(path)
+            provider(None, lambda metadata, error: captured.update(metadata=metadata, error=error))
+            self.assertIsNone(captured["error"])
+            self.assertEqual(captured["metadata"], (
+                ("authorization", "Bearer first-token-value-with-more-than-32-bytes"),
+            ))
+
+            path.write_text("second-token-value-with-more-than-32-bytes", encoding="utf-8")
+            provider(None, lambda metadata, error: captured.update(metadata=metadata, error=error))
+            self.assertEqual(captured["metadata"], (
+                ("authorization", "Bearer second-token-value-with-more-than-32-bytes"),
+            ))
+
     def test_gateway_security_rejects_public_bind_without_auth(self):
         with self.assertRaisesRegex(ValueError, "public gateway binding is disabled"):
             gateway.validate_gateway_security("0.0.0.0", None)

@@ -37,10 +37,11 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include <grpc/impl/channel_arg_names.h>
+#include <grpc/impl/codegen/grpc_types.h>
 #include <grpcpp/grpcpp.h>
 #include "kvstore.grpc.pb.h"
 #include "runtime_config.h"
+#include "file_credentials.h"
 
 using grpc::ClientContext;
 using grpc::Server;
@@ -130,11 +131,12 @@ void LogEvent(const std::string &level, int level_priority, const std::string &e
 
 void HandleTerminationSignal(int signal_number)
 {
-    termination_signal = signal_number;
+    const char wakeup = signal_number == SIGHUP ? 'R' : 'S';
+    if (wakeup == 'S')
+        termination_signal = signal_number;
     const int wakeup_fd = static_cast<int>(shutdown_wakeup_fd);
     if (wakeup_fd >= 0)
     {
-        const char wakeup = 1;
         const auto ignored = write(wakeup_fd, &wakeup, sizeof(wakeup));
         (void)ignored;
     }
@@ -149,6 +151,7 @@ struct TlsConfig
     std::string private_key_file;
     std::string auth_file;
     std::string token_file;
+    std::string crl_directory;
 
     bool Enabled() const
     {
@@ -161,7 +164,14 @@ struct TlsConfig
     }
 };
 
-using TokenRoles = std::unordered_map<std::string, std::unordered_set<std::string>>;
+struct TokenPolicy
+{
+    std::unordered_set<std::string> roles;
+    std::vector<std::string> read_prefixes;
+    std::vector<std::string> write_prefixes;
+};
+
+using TokenRoles = std::unordered_map<std::string, TokenPolicy>;
 
 static bool IsPrivateFile(const std::filesystem::path &path)
 {
@@ -208,8 +218,12 @@ static TokenRoles LoadTokenRoles(const std::filesystem::path &path)
             hash.find_first_not_of("0123456789abcdef") != std::string::npos)
             throw std::runtime_error("authorization token hash must be lowercase SHA-256 hex at line " +
                                      std::to_string(line_number));
-        std::unordered_set<std::string> roles;
-        std::istringstream role_stream(line.substr(separator + 1));
+        TokenPolicy policy;
+        std::istringstream section_stream(line.substr(separator + 1));
+        std::string role_section;
+        if (!std::getline(section_stream, role_section, ';'))
+            throw std::runtime_error("missing authorization roles at line " + std::to_string(line_number));
+        std::istringstream role_stream(role_section);
         std::string role;
         while (std::getline(role_stream, role, ','))
         {
@@ -220,9 +234,55 @@ static TokenRoles LoadTokenRoles(const std::filesystem::path &path)
             role = role.substr(role_start, role_end - role_start + 1);
             if (!valid_roles.count(role))
                 throw std::runtime_error("unknown authorization role at line " + std::to_string(line_number));
-            roles.insert(role);
+            policy.roles.insert(role);
         }
-        if (roles.empty() || !roles_by_hash.emplace(hash, std::move(roles)).second)
+
+        bool read_scope_configured = false;
+        bool write_scope_configured = false;
+        std::string scope_field;
+        while (std::getline(section_stream, scope_field, ';'))
+        {
+            const auto field_start = scope_field.find_first_not_of(" \t\r\n");
+            const auto field_end = scope_field.find_last_not_of(" \t\r\n");
+            if (field_start == std::string::npos)
+                throw std::runtime_error("empty authorization scope at line " +
+                                         std::to_string(line_number));
+            scope_field = scope_field.substr(field_start, field_end - field_start + 1);
+            const auto scope_separator = scope_field.find('=');
+            if (scope_separator == std::string::npos)
+                throw std::runtime_error("invalid authorization scope at line " +
+                                         std::to_string(line_number));
+            const std::string scope_name = scope_field.substr(0, scope_separator);
+            auto &prefixes = scope_name == "read_prefixes" ? policy.read_prefixes :
+                             scope_name == "write_prefixes" ? policy.write_prefixes :
+                             policy.read_prefixes;
+            bool *configured = scope_name == "read_prefixes" ? &read_scope_configured :
+                               scope_name == "write_prefixes" ? &write_scope_configured : nullptr;
+            if (!configured || *configured)
+                throw std::runtime_error("unknown or duplicate authorization scope at line " +
+                                         std::to_string(line_number));
+            *configured = true;
+            std::istringstream prefix_stream(scope_field.substr(scope_separator + 1));
+            std::string prefix;
+            while (std::getline(prefix_stream, prefix, ','))
+            {
+                const auto prefix_start = prefix.find_first_not_of(" \t\r\n");
+                const auto prefix_end = prefix.find_last_not_of(" \t\r\n");
+                if (prefix_start == std::string::npos)
+                    throw std::runtime_error("empty key prefix at line " + std::to_string(line_number));
+                prefix = prefix.substr(prefix_start, prefix_end - prefix_start + 1);
+                prefixes.push_back(prefix);
+            }
+            if (prefixes.empty() ||
+                (std::find(prefixes.begin(), prefixes.end(), "*") != prefixes.end() && prefixes.size() != 1))
+                throw std::runtime_error("invalid wildcard key scope at line " +
+                                         std::to_string(line_number));
+        }
+        if ((read_scope_configured && !policy.roles.count("read")) ||
+            (write_scope_configured && !policy.roles.count("write")))
+            throw std::runtime_error("key scope requires its matching role at line " +
+                                     std::to_string(line_number));
+        if (policy.roles.empty() || !roles_by_hash.emplace(hash, std::move(policy)).second)
             throw std::runtime_error("empty or duplicate authorization entry at line " +
                                      std::to_string(line_number));
     }
@@ -244,14 +304,6 @@ static std::string ReadSecretFile(const std::filesystem::path &path)
     if (token.size() < 32)
         throw std::runtime_error("token file must contain at least 32 bytes");
     return token;
-}
-
-static std::string ReadTextFile(const std::string &path)
-{
-    std::ifstream input(path);
-    if (!input)
-        throw std::runtime_error("failed to read TLS file: " + path);
-    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
 // The three states a Raft node can be in at any point in time.
@@ -415,19 +467,11 @@ private:
             if (separator == std::string::npos || separator + 1 == address.size())
                 throw std::runtime_error("invalid peer endpoint in membership file: " + address);
             updated_ids.push_back(std::stoi(address.substr(separator + 1)));
-            std::shared_ptr<grpc::ChannelCredentials> credentials;
-            if (tls_config.Enabled())
-            {
-                grpc::SslCredentialsOptions options;
-                options.pem_root_certs = ReadTextFile(tls_config.ca_file);
-                options.pem_cert_chain = ReadTextFile(tls_config.certificate_file);
-                options.pem_private_key = ReadTextFile(tls_config.private_key_file);
-                credentials = grpc::SslCredentials(options);
-            }
-            else
-            {
-                credentials = grpc::InsecureChannelCredentials();
-            }
+            auto credentials = tls_config.Enabled()
+                ? kvstore_credentials::CreateChannelCredentials(
+                      tls_config.ca_file, tls_config.certificate_file,
+                      tls_config.private_key_file, tls_config.crl_directory)
+                : grpc::InsecureChannelCredentials();
             updated.emplace_back(KVStore::NewStub(grpc::CreateChannel(address, credentials)));
         }
         if (updated.empty())
@@ -448,7 +492,7 @@ private:
     // Core Raft state.
     std::atomic<NodeState> state{NodeState::FOLLOWER};
     std::atomic<bool> leader_ready{false};
-    int current_term = 0;
+    std::atomic<int> current_term{0};
     int voted_for = -1;
     int known_leader_id = -1;
     int node_id;
@@ -478,6 +522,7 @@ private:
     std::filesystem::path data_directory;
     std::ofstream wal;
     TlsConfig tls_config;
+    mutable std::mutex credentials_mutex;
     TokenRoles token_roles;
     std::string node_token;
     struct RpcMetric
@@ -537,8 +582,13 @@ private:
 
     void AddNodeAuth(ClientContext &context) const
     {
-        if (!node_token.empty())
-            context.AddMetadata("authorization", "Bearer " + node_token);
+        std::string token;
+        {
+            std::lock_guard<std::mutex> lock(credentials_mutex);
+            token = node_token;
+        }
+        if (!token.empty())
+            context.AddMetadata("authorization", "Bearer " + token);
     }
 
     static void AddForwardedAuth(const ServerContext *incoming, ClientContext &outgoing)
@@ -548,14 +598,24 @@ private:
             outgoing.AddMetadata("authorization", std::string(token->second.data(), token->second.size()));
     }
 
-    Status Authorize(const ServerContext *context, const std::string &required_role) const
+    static bool PolicyAllowsKey(const TokenPolicy &policy, const std::string &role,
+                                const std::string &key)
+    {
+        const auto &prefixes = role == "read" ? policy.read_prefixes : policy.write_prefixes;
+        if (prefixes.empty())
+            return true;
+        return std::any_of(prefixes.begin(), prefixes.end(), [&](const std::string &prefix) {
+            return prefix == "*" || key.compare(0, prefix.size(), prefix) == 0;
+        });
+    }
+
+    Status Authorize(const ServerContext *context, const std::string &required_role,
+                     const std::string &method,
+                     const std::string *key = nullptr,
+                     TokenPolicy *authorized_policy = nullptr) const
     {
         if (tls_config.auth_file.empty())
             return Status::OK;
-        std::string method = context->method();
-        const auto method_separator = method.rfind('/');
-        if (method_separator != std::string::npos)
-            method.erase(0, method_separator + 1);
         auto reject = [this, &method](grpc::StatusCode code, const char *message) {
             RecordRpcError(method);
             return Status(code, message);
@@ -570,11 +630,16 @@ private:
         constexpr const char *prefix = "Bearer ";
         if (value.compare(0, 7, prefix) != 0 || value.size() <= 7)
             return reject(grpc::StatusCode::UNAUTHENTICATED, "invalid authorization token");
+        std::lock_guard<std::mutex> lock(credentials_mutex);
         const auto identity = token_roles.find(Sha256Hex(value.substr(7)));
         if (identity == token_roles.end())
             return reject(grpc::StatusCode::UNAUTHENTICATED, "invalid authorization token");
-        if (!identity->second.count(required_role))
+        if (!identity->second.roles.count(required_role))
             return reject(grpc::StatusCode::PERMISSION_DENIED, "authorization role is insufficient");
+        if (key && !PolicyAllowsKey(identity->second, required_role, *key))
+            return reject(grpc::StatusCode::PERMISSION_DENIED, "authorization key scope is insufficient");
+        if (authorized_policy)
+            *authorized_policy = identity->second;
         return Status::OK;
     }
 
@@ -1039,6 +1104,7 @@ private:
     {
         const auto snapshot_path = data_directory / "raft.snapshot";
         const auto temporary = data_directory / "raft.snapshot.tmp";
+        std::uint64_t payload_bytes = 0;
         {
             std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
             const std::string payload = SerializeSnapshotPayload(snapshot_store, completed_requests,
@@ -1046,6 +1112,7 @@ private:
             if (payload.size() > std::numeric_limits<std::uint32_t>::max())
                 throw std::runtime_error("Raft snapshot exceeds the supported size limit");
             const auto payload_size = static_cast<std::uint32_t>(payload.size());
+            payload_bytes = payload_size;
             const auto checksum = ComputeCrc32(payload);
             output.write("RKVSNP01", 8);
             output.write(reinterpret_cast<const char *>(&last_index), sizeof(last_index));
@@ -1061,7 +1128,7 @@ private:
         std::filesystem::rename(temporary, snapshot_path);
         SyncDirectoryPath(data_directory);
         snapshots_written.fetch_add(1);
-        snapshot_bytes_written.fetch_add(payload.size());
+        snapshot_bytes_written.fetch_add(payload_bytes);
     }
 
     void CompactSnapshot()
@@ -1550,6 +1617,20 @@ private:
     }
 
 public:
+    void ReloadSecurityFiles()
+    {
+        if (tls_config.auth_file.empty())
+            return;
+        auto updated_roles = LoadTokenRoles(tls_config.auth_file);
+        auto updated_node_token = ReadSecretFile(tls_config.token_file);
+        {
+            std::lock_guard<std::mutex> lock(credentials_mutex);
+            token_roles = std::move(updated_roles);
+            node_token = std::move(updated_node_token);
+        }
+        LogEvent("info", 1, "security_credentials_reloaded");
+    }
+
     std::string RenderMetrics() const
     {
         std::ostringstream metrics;
@@ -1713,19 +1794,11 @@ public:
 
         for (const auto &addr : peer_addresses)
         {
-            std::shared_ptr<grpc::ChannelCredentials> credentials;
-            if (tls_config.Enabled())
-            {
-                grpc::SslCredentialsOptions options;
-                options.pem_root_certs = ReadTextFile(tls_config.ca_file);
-                options.pem_cert_chain = ReadTextFile(tls_config.certificate_file);
-                options.pem_private_key = ReadTextFile(tls_config.private_key_file);
-                credentials = grpc::SslCredentials(options);
-            }
-            else
-            {
-                credentials = grpc::InsecureChannelCredentials();
-            }
+            auto credentials = tls_config.Enabled()
+                ? kvstore_credentials::CreateChannelCredentials(
+                      tls_config.ca_file, tls_config.certificate_file,
+                      tls_config.private_key_file, tls_config.crl_directory)
+                : grpc::InsecureChannelCredentials();
             auto channel = grpc::CreateChannel(addr, credentials);
             peer_stubs.emplace_back(KVStore::NewStub(channel));
         }
@@ -1833,7 +1906,7 @@ public:
     Status AppendEntries(ServerContext *context, const AppendEntriesRequest *request, AppendEntriesResponse *response) override
     {
         RpcMetricTimer metric(*this, "AppendEntries");
-        const auto authorization = Authorize(context, "node");
+        const auto authorization = Authorize(context, "node", "AppendEntries");
         if (!authorization.ok())
             return authorization;
         if (request->leader_id() != node_id && !IsConfiguredPeer(request->leader_id()))
@@ -1970,7 +2043,7 @@ public:
     Status InstallSnapshot(ServerContext *context, const kvstore::InstallSnapshotRequest *request, kvstore::InstallSnapshotResponse *response) override
     {
         RpcMetricTimer metric(*this, "InstallSnapshot");
-        const auto authorization = Authorize(context, "node");
+        const auto authorization = Authorize(context, "node", "InstallSnapshot");
         if (!authorization.ok())
             return authorization;
         if (request->leader_id() != node_id && !IsConfiguredPeer(request->leader_id()))
@@ -2084,7 +2157,7 @@ public:
     Status RequestVote(ServerContext *context, const VoteRequest *request, VoteResponse *response) override
     {
         RpcMetricTimer metric(*this, "RequestVote");
-        const auto authorization = Authorize(context, "node");
+        const auto authorization = Authorize(context, "node", "RequestVote");
         if (!authorization.ok())
             return authorization;
         if (request->candidate_id() != node_id && !IsConfiguredPeer(request->candidate_id()))
@@ -2157,7 +2230,7 @@ public:
     Status Heartbeat(ServerContext *context, const HeartbeatRequest *request, HeartbeatResponse *response) override
     {
         RpcMetricTimer metric(*this, "Heartbeat");
-        const auto authorization = Authorize(context, "node");
+        const auto authorization = Authorize(context, "node", "Heartbeat");
         if (!authorization.ok())
             return authorization;
         if (request->leader_port() != node_id && !IsConfiguredPeer(request->leader_port()))
@@ -2197,7 +2270,7 @@ public:
     Status Get(ServerContext *context, const GetRequest *request, GetResponse *response) override
     {
         RpcMetricTimer metric(*this, "Get");
-        const auto authorization = Authorize(context, "read");
+        const auto authorization = Authorize(context, "read", "Get", &request->key());
         if (!authorization.ok())
             return authorization;
         if (state == NodeState::LEADER && request->consistency() == kvstore::ReadConsistency::STRONG &&
@@ -2264,7 +2337,8 @@ public:
     Status ListKeys(ServerContext *context, const ListKeysRequest *request, ListKeysResponse *response) override
     {
         RpcMetricTimer metric(*this, "ListKeys");
-        const auto authorization = Authorize(context, "read");
+        TokenPolicy key_policy;
+        const auto authorization = Authorize(context, "read", "ListKeys", nullptr, &key_policy);
         if (!authorization.ok())
             return authorization;
         if (state == NodeState::LEADER && request->consistency() == kvstore::ReadConsistency::STRONG &&
@@ -2285,6 +2359,8 @@ public:
                 keys.reserve(store.size());
                 for (const auto &[key, value] : store)
                 {
+                    if (!PolicyAllowsKey(key_policy, "read", key))
+                        continue;
                     keys.push_back(key);
                 }
                 std::sort(keys.begin(), keys.end());
@@ -2323,6 +2399,8 @@ public:
         keys.reserve(store.size());
         for (const auto &[key, value] : store)
         {
+            if (!PolicyAllowsKey(key_policy, "read", key))
+                continue;
             keys.push_back(key);
         }
         std::sort(keys.begin(), keys.end());
@@ -2334,17 +2412,29 @@ public:
         return Status::OK;
     }
 
-    Status GetClusterStatus(ServerContext *context, const ClusterStatusRequest *request, ClusterStatusResponse *response) override
+    Status GetClusterStatus(ServerContext *context, const ClusterStatusRequest *, ClusterStatusResponse *response) override
     {
         RpcMetricTimer metric(*this, "GetClusterStatus");
-        const auto authorization = Authorize(context, "monitor");
+        const auto authorization = Authorize(context, "monitor", "GetClusterStatus");
         if (!authorization.ok())
             return authorization;
-        const int leader_id = state == NodeState::LEADER ? node_id : known_leader_id;
+        const auto current_state = state.load();
+        int term;
+        int leader_id;
+        {
+            std::lock_guard<std::mutex> lock(election_mutex);
+            term = current_term.load();
+            leader_id = current_state == NodeState::LEADER ? node_id : known_leader_id;
+        }
+        int committed;
+        {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            committed = commit_index;
+        }
         response->set_node_id(node_id);
-        response->set_current_term(current_term);
-        response->set_commit_index(commit_index);
-        response->set_is_leader(state == NodeState::LEADER && leader_ready);
+        response->set_current_term(term);
+        response->set_commit_index(committed);
+        response->set_is_leader(current_state == NodeState::LEADER && leader_ready.load());
         response->set_leader_id(leader_id);
         return Status::OK;
     }
@@ -2352,7 +2442,7 @@ public:
     Status Set(ServerContext *context, const SetRequest *request, SetResponse *response) override
     {
         RpcMetricTimer metric(*this, "Set");
-        const auto authorization = Authorize(context, "write");
+        const auto authorization = Authorize(context, "write", "Set", &request->key());
         if (!authorization.ok())
             return authorization;
         if (request->key().empty() || request->key().size() > kMaxKeyBytes ||
@@ -2447,7 +2537,7 @@ public:
     Status Delete(ServerContext *context, const DeleteRequest *request, DeleteResponse *response) override
     {
         RpcMetricTimer metric(*this, "Delete");
-        const auto authorization = Authorize(context, "write");
+        const auto authorization = Authorize(context, "write", "Delete", &request->key());
         if (!authorization.ok())
             return authorization;
         if (request->key().empty() || request->key().size() > kMaxKeyBytes ||
@@ -2695,14 +2785,11 @@ bool RunServer(const std::string &bind_address, const std::string &port,
     builder.SetMaxReceiveMessageSize(16 * 1024 * 1024);
     if (tls_config.Enabled())
     {
-        grpc::SslServerCredentialsOptions options;
-        options.pem_root_certs = ReadTextFile(tls_config.ca_file);
-        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
-        key_cert.private_key = ReadTextFile(tls_config.private_key_file);
-        key_cert.cert_chain = ReadTextFile(tls_config.certificate_file);
-        options.pem_key_cert_pairs.push_back(std::move(key_cert));
-        options.client_certificate_request = GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
-        builder.AddListeningPort(server_address, grpc::SslServerCredentials(options));
+        builder.AddListeningPort(
+            server_address,
+            kvstore_credentials::CreateServerCredentials(
+                tls_config.ca_file, tls_config.certificate_file,
+                tls_config.private_key_file, tls_config.crl_directory));
     }
     else
     {
@@ -2725,38 +2812,75 @@ bool RunServer(const std::string &bind_address, const std::string &port,
     }
 
     LogEvent("info", 1, "grpc_listener_started",
-             {{"address", server_address}, {"node_id", std::to_string(port)}});
+             {{"address", server_address}, {"node_id", port}});
     termination_signal = 0;
     shutdown_wakeup_fd = shutdown_pipe[1];
     std::signal(SIGINT, HandleTerminationSignal);
     std::signal(SIGTERM, HandleTerminationSignal);
+    std::signal(SIGHUP, HandleTerminationSignal);
     std::atomic<bool> wait_complete{false};
     std::thread shutdown_watcher([&]() {
         pollfd wakeup{shutdown_pipe[0], POLLIN, 0};
-        while (poll(&wakeup, 1, -1) < 0)
+        while (true)
         {
-            if (errno == EINTR)
+            const int poll_result = poll(&wakeup, 1, -1);
+            if (poll_result < 0 && errno == EINTR)
                 continue;
-            LogEvent("error", 3, "graceful_shutdown_wait_failed",
-                     {{"error", std::strerror(errno)}});
-            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(10));
-            return;
-        }
-        if (!wait_complete.load() && termination_signal != 0)
-        {
-            LogEvent("info", 1, "graceful_shutdown_started",
-                     {{"signal", std::to_string(termination_signal)}});
-            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            if (poll_result < 0)
+            {
+                LogEvent("error", 3, "graceful_shutdown_wait_failed",
+                         {{"error", std::strerror(errno)}});
+                server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(10));
+                return;
+            }
+
+            char signals[64];
+            const auto count = read(shutdown_pipe[0], signals, sizeof(signals));
+            if (count < 0 && (errno == EAGAIN || errno == EINTR))
+                continue;
+            if (count <= 0)
+                return;
+            for (ssize_t index = 0; index < count; ++index)
+            {
+                if (signals[index] == 'R')
+                {
+                    try
+                    {
+                        service.ReloadSecurityFiles();
+                    }
+                    catch (const std::exception &error)
+                    {
+                        LogEvent("error", 3, "security_credentials_reload_failed",
+                                 {{"error", error.what()}});
+                    }
+                }
+                else if (signals[index] == 'S')
+                {
+                    if (!wait_complete.load())
+                    {
+                        LogEvent("info", 1, "graceful_shutdown_started",
+                                 {{"signal", std::to_string(termination_signal)}});
+                        server->Shutdown(std::chrono::system_clock::now() +
+                                         std::chrono::seconds(10));
+                    }
+                    return;
+                }
+                else if (signals[index] == 'Q')
+                {
+                    return;
+                }
+            }
         }
     });
     server->Wait();
     wait_complete = true;
-    const char wakeup = 0;
+    const char wakeup = 'Q';
     const auto ignored = write(shutdown_pipe[1], &wakeup, sizeof(wakeup));
     (void)ignored;
     shutdown_watcher.join();
     std::signal(SIGINT, SIG_DFL);
     std::signal(SIGTERM, SIG_DFL);
+    std::signal(SIGHUP, SIG_DFL);
     shutdown_wakeup_fd = -1;
     close(shutdown_pipe[0]);
     close(shutdown_pipe[1]);
@@ -2811,6 +2935,7 @@ int main(int argc, char **argv)
     tls_config.private_key_file = runtime_config.private_key_file;
     tls_config.auth_file = runtime_config.auth_file.string();
     tls_config.token_file = runtime_config.token_file.string();
+    tls_config.crl_directory = runtime_config.crl_directory.string();
     bool insecure_dev = false;
     bool invalid_peer_endpoint = false;
 
@@ -2881,6 +3006,11 @@ int main(int argc, char **argv)
             tls_config.token_file = argv[++i];
             continue;
         }
+        if (std::string(argv[i]) == "--crl-directory" && i + 1 < argc)
+        {
+            tls_config.crl_directory = argv[++i];
+            continue;
+        }
         if (std::string(argv[i]) == "--insecure-dev")
         {
             insecure_dev = true;
@@ -2923,6 +3053,11 @@ int main(int argc, char **argv)
         std::cerr << "--auth-file and --token-file must be configured together." << std::endl;
         return 2;
     }
+    if (!tls_config.Enabled() && !tls_config.crl_directory.empty())
+    {
+        std::cerr << "--crl-directory requires TLS credentials." << std::endl;
+        return 2;
+    }
 
     const bool loopback_bind = bind_address == "localhost" || bind_address == "127.0.0.1" ||
                                bind_address == "::1" || bind_address == "[::1]";
@@ -2947,6 +3082,12 @@ int main(int argc, char **argv)
     effective_config.metrics_port = metrics_port;
     effective_config.metrics_bind = metrics_bind;
     effective_config.peers = peer_addresses;
+    effective_config.ca_file = tls_config.ca_file;
+    effective_config.certificate_file = tls_config.certificate_file;
+    effective_config.private_key_file = tls_config.private_key_file;
+    effective_config.crl_directory = tls_config.crl_directory;
+    effective_config.auth_file = tls_config.auth_file;
+    effective_config.token_file = tls_config.token_file;
     try
     {
         ValidateRuntimeConfig(effective_config);

@@ -152,8 +152,9 @@ node-token file, and all three TLS files. A secure server command resembles:
 
 The node listener defaults to `127.0.0.1`; use a private interface address only when
 cluster peers need remote access. The TLS SAN must match each address clients use.
-The token authorization file contains token hashes and role names; never commit token
-files or private keys.
+The token authorization file contains token hashes, role names, and optional key-prefix
+scopes; never commit token files or private keys. See [the security guide](SECURITY.md)
+for SIGHUP reload, CRLs, scoped-token syntax, and the credential rotation helper.
 
 Outbound peer endpoints can be reloaded without restarting a node. Pass `--peers-file` and keep one
 `host:port` endpoint per line; editing the file updates the peer stubs. This is not Raft joint

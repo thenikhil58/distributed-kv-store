@@ -1,8 +1,6 @@
 #include <chrono>
 #include <algorithm>
-#include <filesystem>
 #include <iostream>
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <random>
@@ -13,6 +11,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include "kvstore.grpc.pb.h"
+#include "file_credentials.h"
 
 using grpc::ClientContext;
 using grpc::Status;
@@ -29,34 +28,13 @@ struct TlsConfig
     std::string certificate_file;
     std::string private_key_file;
     std::string token_file;
+    std::string crl_directory;
 
     bool Enabled() const
     {
         return !ca_file.empty() && !certificate_file.empty() && !private_key_file.empty();
     }
 };
-
-static std::string ReadTextFile(const std::string &path)
-{
-    std::ifstream input(path);
-    if (!input)
-        throw std::runtime_error("failed to read TLS file: " + path);
-    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-}
-
-static std::string ReadPrivateToken(const std::string &path)
-{
-    const auto permissions = std::filesystem::status(path).permissions();
-    if ((permissions & (std::filesystem::perms::group_all |
-                       std::filesystem::perms::others_all)) != std::filesystem::perms::none)
-        throw std::runtime_error("token file must have mode 0600 or stricter: " + path);
-    auto token = ReadTextFile(path);
-    while (!token.empty() && (token.back() == '\n' || token.back() == '\r'))
-        token.pop_back();
-    if (token.size() < 32)
-        throw std::runtime_error("token file must contain at least 32 bytes");
-    return token;
-}
 
 // A thin wrapper around the generated gRPC stub, exposing simple
 // Set()/Get() methods for interacting with the KV store cluster.
@@ -249,6 +227,8 @@ int main(int argc, char **argv)
             tls_config.private_key_file = argv[++i];
         else if (std::string(argv[i]) == "--token-file" && i + 1 < argc)
             tls_config.token_file = argv[++i];
+        else if (std::string(argv[i]) == "--crl-directory" && i + 1 < argc)
+            tls_config.crl_directory = argv[++i];
         else if (std::string(argv[i]) == "--insecure-dev")
             insecure_dev = true;
     }
@@ -261,9 +241,11 @@ int main(int argc, char **argv)
         std::cerr << "--ca, --cert, and --key must be provided together." << std::endl;
         return 2;
     }
-    if (tls_config.Enabled() != !tls_config.token_file.empty())
+    if (tls_config.Enabled() != !tls_config.token_file.empty() ||
+        (!tls_config.Enabled() && !tls_config.crl_directory.empty()))
     {
-        std::cerr << "mTLS credentials and --token-file must be provided together." << std::endl;
+        std::cerr << "mTLS and --token-file are required together; --crl-directory requires mTLS."
+                  << std::endl;
         return 2;
     }
 
@@ -293,14 +275,13 @@ int main(int argc, char **argv)
     {
         if (tls_config.Enabled())
         {
-            grpc::SslCredentialsOptions options;
-            options.pem_root_certs = ReadTextFile(tls_config.ca_file);
-            options.pem_cert_chain = ReadTextFile(tls_config.certificate_file);
-            options.pem_private_key = ReadTextFile(tls_config.private_key_file);
-            credentials = grpc::SslCredentials(options);
+            credentials = kvstore_credentials::CreateChannelCredentials(
+                tls_config.ca_file, tls_config.certificate_file,
+                tls_config.private_key_file, tls_config.crl_directory);
             if (!tls_config.token_file.empty())
                 credentials = grpc::CompositeChannelCredentials(
-                    credentials, grpc::AccessTokenCredentials(ReadPrivateToken(tls_config.token_file)));
+                    credentials, kvstore_credentials::CreateFileTokenCredentials(
+                                     tls_config.token_file));
         }
         else
         {

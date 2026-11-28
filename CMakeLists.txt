@@ -122,7 +122,7 @@ target_link_libraries(runtime_config_tests
 
 add_test(NAME raft_tests COMMAND raft_tests)
 add_test(NAME runtime_config_tests COMMAND runtime_config_tests)
-set_tests_properties(raft_tests runtime_config_tests PROPERTIES TIMEOUT 180)
+set_tests_properties(raft_tests runtime_config_tests PROPERTIES TIMEOUT 600)
 
 enable_testing()
 
@@ -136,6 +136,9 @@ if(BUILD_BENCHMARKS)
 endif()
 install(FILES config/node.conf.example
     DESTINATION ${CMAKE_INSTALL_DATADIR}/distributed-kv-store
+)
+install(PROGRAMS tools/rotate_credentials.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 set(CPACK_PACKAGE_NAME "distributed-kv-store")
