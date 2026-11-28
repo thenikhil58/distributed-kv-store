@@ -133,7 +133,26 @@ Python dependency audit, and macOS build/test. A local TSan build is available t
 `-DENABLE_TSAN=ON`, but distro gRPC/Abseil libraries are not instrumented and report
 races in their own internals. TSan also found an application race in cluster-status
 reads, which has been fixed; the overall run is not clean and should not be treated as
-a clean project result. A full C++ integration run takes several minutes because it launches and gracefully
+a clean project result. To build gRPC and its bundled Abseil, protobuf, and supporting
+dependencies with TSan, clone gRPC v1.51.1 with submodules initialized, then configure
+the project with `-DENABLE_TSAN=ON` and
+`-DKVSTORE_TSAN_GRPC_SOURCE_DIR=/path/to/grpc`. The CMake option requires an explicit
+v1.51.1 source checkout; normal configuration does not fetch dependencies. The checkout
+must include its Abseil, protobuf, re2, c-ares, and zlib submodules. For example:
+
+```bash
+git clone --depth 1 --branch v1.51.1 --recurse-submodules \
+  https://github.com/grpc/grpc.git /tmp/grpc-tsan
+cmake -S . -B build-tsan-instrumented -DENABLE_TSAN=ON \
+  -DKVSTORE_TSAN_GRPC_SOURCE_DIR=/tmp/grpc-tsan
+cmake --build build-tsan-instrumented --parallel
+setarch "$(uname -m)" -R ctest --test-dir build-tsan-instrumented --output-on-failure
+```
+
+Record the resolved gRPC commit and archive the complete TSan output. A clean run is not
+established until this configuration completes and the reports are reviewed.
+
+A full C++ integration run takes several minutes because it launches and gracefully
 stops many local Raft processes.
 A passing test run is not a production-readiness guarantee; see [the production
 readiness notes](PRODUCTION-READINESS.md) and [release process](RELEASE-PROCESS.md)

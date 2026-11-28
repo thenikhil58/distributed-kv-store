@@ -158,7 +158,7 @@ operator/release gates.
 - ✅ Add a deterministic paused-leader failover/rejoin regression; CI also runs the existing Raft and persistence integration tests.
 - ✅ Add clean C++/Python test, ASan/UBSan, Python dependency-audit, and macOS build/test workflow gates.
 - ✅ Publish known compatibility limits, version/tag policy, repository release gates, and external qualification gates in the [release process](RELEASE-PROCESS.md).
-- ⬜ Establish a reliable TSan gate against instrumented gRPC/Abseil dependencies. The available distro libraries produce reports inside uninstrumented runtime internals; TSan also exposed an application race in cluster-status reads, which was fixed, but the overall run is not clean or suppressed.
+- ⬜ Establish a reliable TSan gate against instrumented gRPC/Abseil dependencies. CMake now supports an explicit gRPC source checkout so sanitizer flags also cover those dependencies; this configuration has not been built or run. The available distro libraries produced reports inside uninstrumented runtime internals; TSan also exposed an application race in cluster-status reads, which was fixed.
 - ⬜ Measure representative workloads and capacity across approved cluster sizes and target storage/network profiles; local benchmark output is not a capacity claim.
 - ⬜ Complete partition, delay/reordering, disk-full/I/O, crash/power-loss, restore, and node-replacement qualification in the intended environment.
 - ⬜ Obtain independent consensus/persistence/security review, staging soak, restore sign-off, and approved operational targets.
